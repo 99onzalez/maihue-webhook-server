@@ -64,8 +64,8 @@ const FORM_URLS = {
 // Audios por segmento (ruta dentro del contenedor de Railway)
 // "Poco Pie" usa el audio que ya tenemos. "Calificado" se sube más adelante.
 const AUDIO_PATHS = {
-  calificado: process.env.AUDIO_PATH_CALIFICADO || '/app/audios/audio_calificado.aac',
-  poco_pie: process.env.AUDIO_PATH_POCO_PIE || '/app/audios/audio_pdo_gerardo.aac'
+  calificado: process.env.AUDIO_PATH_CALIFICADO || '/app/audios/audio_calificado.mp3',
+  poco_pie: process.env.AUDIO_PATH_POCO_PIE || '/app/audios/audio_pdo_gerardo.mp3'
 };
 
 // Valores exactos que llegan desde el formulario de Meta (pregunta de presupuesto)
@@ -74,10 +74,27 @@ const BUDGET_VALUES = {
   poco_pie: 'Entre $4.000.000 y $6.000.000'
 };
 
+// Mapeo: ID de usuario "Assigned To" en GHL -> clave interna del ejecutivo
+// Ve a Settings → My Staff → click en el usuario → revisa la URL para obtener el ID
+const OWNER_ID_MAP = {
+  'xfGUbyF37C0bBtsNGHgb': 'gerardo',
+  // 'ID_DE_JOSEFINA_AQUI': 'josefina',
+  // 'ID_DE_CAROLINA_AQUI': 'carolina',
+};
+
 /**
- * Determina el segmento (calificado / poco_pie) según la respuesta de presupuesto
+ * Traduce el ID del "Assigned To" de GHL a nuestra clave interna de ejecutivo
  */
-function getSegment(budgetAnswer) {
+function mapOwnerToExecutive(assignedToId) {
+  if (!assignedToId) return null;
+  return OWNER_ID_MAP[assignedToId.trim()] || null;
+}
+function getSegment(budgetAnswer, tags) {
+  if (tags) {
+    const tagList = (Array.isArray(tags) ? tags : tags.split(',')).map(t => t.trim().toLowerCase());
+    if (tagList.includes('calificado-volkania')) return 'calificado';
+    if (tagList.includes('poco-pie-volkania')) return 'poco_pie';
+  }
   if (!budgetAnswer) return 'poco_pie'; // fallback seguro
   const answer = budgetAnswer.trim();
   if (answer === BUDGET_VALUES.calificado) return 'calificado';
@@ -215,8 +232,9 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
       {
         number: phoneNumber,
         mediatype: 'audio',
+        mimetype: 'audio/mpeg',
         media: base64Audio,
-        fileName: 'mensaje_bienvenida.aac'
+        fileName: 'mensaje_bienvenida.mp3'
       },
       {
         headers: {
@@ -296,7 +314,9 @@ app.post('/webhook/ghl', async (req, res) => {
       opportunityId,
       formUrl,
       project,
-      budgetAnswer
+      budgetAnswer,
+      assignedTo,
+      tags
     } = payload;
     
     // Validar datos mínimos
@@ -318,11 +338,15 @@ app.post('/webhook/ghl', async (req, res) => {
     
     console.log(`🎯 Proyecto identificado: ${projectName}`);
     
-    // Asignar ejecutivo según proyecto
-    let executiveName;
-    if (projectName === 'volkania') {
+    // Asignar ejecutivo: primero confiamos en el Owner que GHL ya asignó
+    let executiveName = mapOwnerToExecutive(assignedTo);
+    
+    if (executiveName) {
+      console.log(`👤 Ejecutivo tomado del Owner asignado en GHL: ${executiveName}`);
+    } else if (projectName === 'volkania') {
+      // Respaldo: si no llegó ningún owner reconocible, usamos Round Robin interno
       executiveName = await getRoundRobinExecutive();
-      console.log(`🔄 Round Robin - Asignado a: ${executiveName}`);
+      console.log(`🔄 Sin owner reconocible, Round Robin interno asignó a: ${executiveName}`);
     } else if (projectName === 'tricalen') {
       executiveName = 'carolina';
       console.log(`📌 Asignado a: Carolina (Tricalén)`);
@@ -340,7 +364,7 @@ app.post('/webhook/ghl', async (req, res) => {
     
     // Determinar segmento (Calificado / Poco Pie) según respuesta de presupuesto
     // Solo aplica para Volkania por ahora; Tricalén usa audio por defecto
-    const segment = projectName === 'volkania' ? getSegment(budgetAnswer) : 'poco_pie';
+    const segment = projectName === 'volkania' ? getSegment(budgetAnswer, tags) : 'poco_pie';
     const audioPath = getAudioPath(segment);
     console.log(`💰 Segmento: ${segment} (respuesta: "${budgetAnswer || 'N/A'}")`);
     
