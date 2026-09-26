@@ -1,0 +1,225 @@
+================================================================================
+                    MAIHUE - QUICK REFERENCE CARD
+================================================================================
+
+INFORMACIÓN CRÍTICA - TENER A MANO
+
+================================================================================
+URLS IMPORTANTES
+================================================================================
+
+Railway Project:
+  https://railway.com/project/ad0ed790-8272-4669-9c14-ec22c8633252
+
+Evolution API Dashboard:
+  https://evolution-api-production-0237.up.railway.app
+
+GitHub Repo (crear):
+  https://github.com/tu-usuario/maihue-webhook-server
+
+GoHighLevel:
+  https://app.gohighlevel.com
+
+================================================================================
+DATOS TÉCNICOS - EVOLUTION API
+================================================================================
+
+Instance ID (Gerardo):
+  9C60DB508943-4380-855D-F5E612394CF5
+
+Número WhatsApp (Gerardo):
+  56961451738
+
+Evolution API URL:
+  https://evolution-api-production-0237.up.railway.app
+
+EVOLUTION_API_KEY:
+  [OBTENER DE EVOLUTION API SETTINGS]
+  → Pasos: Evolution → Settings → API → Generate Key
+
+================================================================================
+VARIABLES DE ENTORNO (copiar exacto)
+================================================================================
+
+EVOLUTION_API_URL=https://evolution-api-production-0237.up.railway.app
+INSTANCE_ID=9C60DB508943-4380-855D-F5E612394CF5
+EVOLUTION_API_KEY=[TU_KEY_AQUI]
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=[SI_APLICA]
+VOLKANIA_FORM_URL=[TU_URL_FORMULARIO]
+TRICALEN_FORM_URL=[TU_URL_FORMULARIO]
+AUDIO_PATH=/app/audios/audio_pdo_gerardo.aac
+PORT=3000
+
+================================================================================
+ENDPOINTS DE PRUEBA
+================================================================================
+
+Health Check:
+  GET https://[tu-url].up.railway.app/health
+
+Send Text Message:
+  curl -X POST https://[tu-url].up.railway.app/test/send-message \
+    -H "Content-Type: application/json" \
+    -d '{"phoneNumber":"56961451738","message":"Hola Gerardo"}'
+
+Send Audio:
+  curl -X POST https://[tu-url].up.railway.app/test/send-audio \
+    -H "Content-Type: application/json" \
+    -d '{"phoneNumber":"56961451738"}'
+
+Debug Round Robin:
+  GET https://[tu-url].up.railway.app/debug/round-robin
+
+Webhook (GHL):
+  POST https://[tu-url].up.railway.app/webhook/ghl
+  Body: {contactName, contactPhone, opportunityId, project, formUrl}
+
+================================================================================
+PASOS RÁPIDOS (30 min)
+================================================================================
+
+1. GITHUB (5 min)
+   ☐ Crear repositorio "maihue-webhook-server"
+   ☐ Clonar
+   ☐ Copiar archivos
+   ☐ git add . && git commit && git push
+
+2. RAILWAY DEPLOY (10 min)
+   ☐ Railway → New → GitHub Repo
+   ☐ Seleccionar maihue-webhook-server
+   ☐ Click Deploy
+   ☐ Esperar a que termine (✅ status)
+
+3. VARIABLES (5 min)
+   ☐ Railway → Servicio → Variables
+   ☐ Agregar todas las variables de arriba
+   ☐ Click Save
+
+4. AUDIO (3 min)
+   ☐ Railway → Volumes → New Volume
+   ☐ Name: audios
+   ☐ Mount: /app/audios
+   ☐ Upload: audio_pdo_gerardo.aac
+
+5. TEST (7 min)
+   ☐ Health check → debe retornar status online
+   ☐ Send message → debe recibir SMS
+   ☐ Send audio → debe recibir audio después 120s
+
+================================================================================
+WEBHOOK EN GOHIGHLEVEL
+================================================================================
+
+URL: https://[tu-url].up.railway.app/webhook/ghl
+
+Body:
+{
+  "contactName": "{{contactFirstName}} {{contactLastName}}",
+  "contactPhone": "{{contactPhone}}",
+  "contactId": "{{contactId}}",
+  "opportunityId": "{{opportunityId}}",
+  "formUrl": "{{formUrl}}",
+  "project": "volkania"
+}
+
+PARA TRICALÉN, cambiar:
+  "project": "tricalen"
+
+================================================================================
+ERRORES COMUNES
+================================================================================
+
+502 Bad Gateway
+  → Servidor aún se está desplegando
+  → Esperar 5 minutos
+
+Cannot connect to Redis
+  → Verificar REDIS_HOST=redis en Variables
+
+Evolution API Error
+  → Verificar EVOLUTION_API_KEY
+  → Verificar INSTANCE_ID
+  → Verificar que Evolution esté online
+
+Audio not found
+  → Verificar ruta: /app/audios/audio_pdo_gerardo.aac
+  → Verificar que volumen está montado
+
+Round Robin no funciona
+  → Verificar Redis está online
+  → GET /debug/round-robin debe retornar estado
+
+================================================================================
+DECISIONES IMPORTANTES
+================================================================================
+
+☐ ¿Dónde guardar el audio?
+   → Recomendado: Volumen persistente en Railway
+
+☐ ¿Qué hacer con las respuestas en WhatsApp?
+   → Por ahora: Quedan en Evolution API
+   → Futuro: Conectarlas de vuelta a GHL
+
+☐ ¿Cuándo agregar Josefina y Carolina?
+   → Después de que todo funcione con Gerardo
+   → Conectarlas en Evolution API
+   → Actualizar server.js con sus números
+
+================================================================================
+FIREBASE / LOGGING (FUTURO)
+================================================================================
+
+Cuando quieras agregar logging:
+  ☐ Conectar Postgres en Railway
+  ☐ Agregar tabla "leads_log"
+  ☐ Modificar server.js para insertar datos
+  ☐ Crear dashboard de analytics
+
+================================================================================
+MANTENIMIENTO
+================================================================================
+
+Revisar cada semana:
+  ☐ Logs en Railway (¿hay errores?)
+  ☐ Round Robin en Redis (¿funciona?)
+  ☐ Evolution API (¿está online?)
+
+Actualizar cuando:
+  ☐ Agregues Josefina: Update server.js + redeploy
+  ☐ Agregues Carolina: Update server.js + redeploy
+  ☐ Cambies audios: Subir nuevo archivo + redeploy
+
+================================================================================
+CONTACTOS Y DOCUMENTOS
+================================================================================
+
+Documentos para leer:
+  1. 00_COMIENZA_AQUI.md (overview)
+  2. PROXIMOS_PASOS.md (checklist)
+  3. DEPLOY_RAILWAY.md (detallado)
+  4. ARQUITECTURA.md (diagramas)
+  5. README.md (técnico)
+
+Emails importantes:
+  Maihue: contact@maihue.cl
+  Gerardo (tú): [tu-email]
+  Josefina: [agregado después]
+  Carolina: [agregado después]
+
+================================================================================
+NOTAS PERSONALES
+================================================================================
+
+[Espacio para agregar tus propias notas]
+
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+
+================================================================================
+VERSIÓN: 1.0
+FECHA: Enero 2025
+PRÓXIMA ACTUALIZACIÓN: Cuando se agreguen más ejecutivos
+================================================================================
