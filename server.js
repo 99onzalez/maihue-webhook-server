@@ -36,8 +36,41 @@ const FORM_URLS = {
   tricalen: process.env.TRICALEN_FORM_URL || 'https://tu-dominio.com/tricalen'
 };
 
-// Audio (ruta dentro del contenedor de Railway)
-const AUDIO_PATH = process.env.AUDIO_PATH || '/app/audios/audio_pdo_gerardo.aac';
+// Audios por segmento (ruta dentro del contenedor de Railway)
+// "Poco Pie" usa el audio que ya tenemos. "Calificado" se sube más adelante.
+const AUDIO_PATHS = {
+  calificado: process.env.AUDIO_PATH_CALIFICADO || '/app/audios/audio_calificado.aac',
+  poco_pie: process.env.AUDIO_PATH_POCO_PIE || '/app/audios/audio_pdo_gerardo.aac'
+};
+
+// Valores exactos que llegan desde el formulario de Meta (pregunta de presupuesto)
+const BUDGET_VALUES = {
+  calificado: 'Más de $6.000.000',
+  poco_pie: 'Entre $4.000.000 y $6.000.000'
+};
+
+/**
+ * Determina el segmento (calificado / poco_pie) según la respuesta de presupuesto
+ */
+function getSegment(budgetAnswer) {
+  if (!budgetAnswer) return 'poco_pie'; // fallback seguro
+  const answer = budgetAnswer.trim();
+  if (answer === BUDGET_VALUES.calificado) return 'calificado';
+  if (answer === BUDGET_VALUES.poco_pie) return 'poco_pie';
+  return 'poco_pie'; // fallback si llega un valor inesperado
+}
+
+/**
+ * Obtiene la ruta de audio correcta, con fallback si el archivo aún no existe
+ */
+function getAudioPath(segment) {
+  const audioPath = AUDIO_PATHS[segment] || AUDIO_PATHS.poco_pie;
+  if (!fs.existsSync(audioPath)) {
+    console.warn(`⚠️  Audio de "${segment}" no encontrado en ${audioPath}, usando audio de respaldo`);
+    return AUDIO_PATHS.poco_pie;
+  }
+  return audioPath;
+}
 
 // =====================
 // REDIS CLIENT
@@ -232,7 +265,8 @@ app.post('/webhook/ghl', async (req, res) => {
       contactPhone,
       opportunityId,
       formUrl,
-      project
+      project,
+      budgetAnswer
     } = req.body;
     
     // Validar datos mínimos
@@ -265,7 +299,13 @@ app.post('/webhook/ghl', async (req, res) => {
     
     const phoneNumber = getExecutivePhone(executiveName);
     
-    // Formatear mensaje
+    // Determinar segmento (Calificado / Poco Pie) según respuesta de presupuesto
+    // Solo aplica para Volkania por ahora; Tricalén usa audio por defecto
+    const segment = projectName === 'volkania' ? getSegment(budgetAnswer) : 'poco_pie';
+    const audioPath = getAudioPath(segment);
+    console.log(`💰 Segmento: ${segment} (respuesta: "${budgetAnswer || 'N/A'}")`);
+    
+    // Formatear mensaje (mismo mensaje para ambos segmentos)
     const projectDisplay = projectName.charAt(0).toUpperCase() + projectName.slice(1);
     const message = `Hola ${contactName}, gracias por tu interés en ${projectDisplay}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
     
@@ -274,7 +314,7 @@ app.post('/webhook/ghl', async (req, res) => {
       phoneNumber,
       contactName,
       message,
-      AUDIO_PATH,
+      audioPath,
       120000
     ).catch(err => {
       console.error('Error en envío de mensaje/audio:', err.message);
@@ -287,13 +327,14 @@ app.post('/webhook/ghl', async (req, res) => {
       data: {
         contactName,
         projectName,
+        segment,
         assignedExecutive: executiveName,
         opportunityId
       }
     });
     
     // Log
-    console.log(`✅ Lead procesado: ${contactName} → ${executiveName} (${projectName})`);
+    console.log(`✅ Lead procesado: ${contactName} → ${executiveName} (${projectName}, ${segment})`);
     
   } catch (err) {
     console.error('❌ Error en webhook:', err.message);
@@ -335,7 +376,7 @@ app.post('/test/send-message', async (req, res) => {
  */
 app.post('/test/send-audio', async (req, res) => {
   try {
-    const { phoneNumber } = req.body;
+    const { phoneNumber, segment } = req.body;
     
     if (!phoneNumber) {
       return res.status(400).json({
@@ -343,10 +384,12 @@ app.post('/test/send-audio', async (req, res) => {
       });
     }
     
-    const result = await sendAudioMessage(phoneNumber, AUDIO_PATH);
+    const audioPath = getAudioPath(segment === 'calificado' ? 'calificado' : 'poco_pie');
+    const result = await sendAudioMessage(phoneNumber, audioPath);
     
     res.json({
       success: true,
+      audioUsed: audioPath,
       result
     });
   } catch (err) {
