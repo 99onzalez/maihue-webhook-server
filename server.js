@@ -260,6 +260,9 @@ app.post('/webhook/ghl', async (req, res) => {
     console.log('📨 Webhook recibido de GHL');
     console.log('Payload:', JSON.stringify(req.body, null, 2));
     
+    // GHL a veces envía los datos anidados dentro de "customData"
+    const payload = req.body.customData || req.body;
+    
     // Extraer datos del webhook
     const {
       contactId,
@@ -269,10 +272,11 @@ app.post('/webhook/ghl', async (req, res) => {
       formUrl,
       project,
       budgetAnswer
-    } = req.body;
+    } = payload;
     
     // Validar datos mínimos
     if (!contactName || !contactPhone) {
+      console.error('❌ Datos insuficientes. contactName:', contactName, '| contactPhone:', contactPhone);
       return res.status(400).json({
         error: 'Datos insuficientes: se requiere nombre y teléfono'
       });
