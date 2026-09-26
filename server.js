@@ -76,12 +76,14 @@ function getAudioPath(segment) {
 // REDIS CLIENT
 // =====================
 
-const redisClient = redis.createClient({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: process.env.REDIS_PORT || 6379,
-  password: process.env.REDIS_PASSWORD || undefined,
-  db: 0
-});
+const redisClient = process.env.REDIS_URL
+  ? redis.createClient({ url: process.env.REDIS_URL })
+  : redis.createClient({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: process.env.REDIS_PORT || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: 0
+    });
 
 redisClient.on('error', (err) => console.error('Redis Error:', err));
 redisClient.on('connect', () => console.log('✅ Redis conectado'));
