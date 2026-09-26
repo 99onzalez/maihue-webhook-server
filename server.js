@@ -23,12 +23,37 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || 'sua-api-key-aqui';
 // GHL Webhook Secret
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || 'tu-secret-aqui';
 
-// Números de ejecutivos (completaremos después)
-const EXECUTIVES = {
-  gerardo: '56961451738', // Tu número
-  josefina: '569XXXXXXXX',
-  carolina: '569XXXXXXXX'
+// Instancia de Evolution API (WhatsApp) por ejecutivo — cada uno envía desde SU propio número
+// Mientras Josefina y Carolina no tengan su número conectado, usamos la de Gerardo como respaldo
+const EXECUTIVE_INSTANCES = {
+  gerardo: process.env.INSTANCE_GERARDO || INSTANCE_ID,
+  josefina: process.env.INSTANCE_JOSEFINA || INSTANCE_ID, // pendiente: conectar número propio
+  carolina: process.env.INSTANCE_CAROLINA || INSTANCE_ID  // pendiente: conectar número propio
 };
+
+/**
+ * Limpia y formatea un número de teléfono al formato que espera Evolution API
+ * Ej: "9 5524 8898" -> "56995248898"
+ */
+function formatPhoneNumber(rawPhone) {
+  if (!rawPhone) return null;
+  // Quitar todo lo que no sea número
+  let digits = rawPhone.replace(/\D/g, '');
+  // Si ya trae el código de país (56) y tiene 11 dígitos, lo dejamos tal cual
+  if (digits.startsWith('56') && digits.length === 11) {
+    return digits;
+  }
+  // Si es un móvil chileno de 9 dígitos empezando en 9, le agregamos 56
+  if (digits.length === 9 && digits.startsWith('9')) {
+    return `56${digits}`;
+  }
+  // Si son 8 dígitos (sin el 9 inicial), agregamos 569
+  if (digits.length === 8) {
+    return `569${digits}`;
+  }
+  // Fallback: devolver tal cual quedó (limpio de espacios/símbolos)
+  return digits;
+}
 
 // URLs de formularios por proyecto
 const FORM_URLS = {
@@ -138,19 +163,19 @@ async function getRoundRobinExecutive() {
 }
 
 /**
- * Obtiene el número de WhatsApp del ejecutivo
+ * Obtiene la instancia de Evolution API (WhatsApp) del ejecutivo asignado
  */
-function getExecutivePhone(executiveName) {
-  return EXECUTIVES[executiveName] || EXECUTIVES.gerardo;
+function getExecutiveInstance(executiveName) {
+  return EXECUTIVE_INSTANCES[executiveName] || EXECUTIVE_INSTANCES.gerardo;
 }
 
 /**
  * Envía mensaje de texto vía Evolution API
  */
-async function sendTextMessage(phoneNumber, message) {
+async function sendTextMessage(phoneNumber, message, instanceId = INSTANCE_ID) {
   try {
     const response = await axios.post(
-      `${EVOLUTION_API_URL}/message/sendText/${INSTANCE_ID}`,
+      `${EVOLUTION_API_URL}/message/sendText/${instanceId}`,
       {
         number: phoneNumber,
         text: message
@@ -163,7 +188,7 @@ async function sendTextMessage(phoneNumber, message) {
       }
     );
     
-    console.log(`✅ Mensaje de texto enviado a ${phoneNumber}`);
+    console.log(`✅ Mensaje de texto enviado a ${phoneNumber} (desde instancia ${instanceId})`);
     return response.data;
   } catch (err) {
     console.error(`❌ Error enviando texto a ${phoneNumber}:`, err.message);
@@ -174,7 +199,7 @@ async function sendTextMessage(phoneNumber, message) {
 /**
  * Envía audio vía Evolution API
  */
-async function sendAudioMessage(phoneNumber, audioPath) {
+async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID) {
   try {
     // Verificar que el archivo existe
     if (!fs.existsSync(audioPath)) {
@@ -186,7 +211,7 @@ async function sendAudioMessage(phoneNumber, audioPath) {
     const base64Audio = audioBuffer.toString('base64');
     
     const response = await axios.post(
-      `${EVOLUTION_API_URL}/message/sendMedia/${INSTANCE_ID}`,
+      `${EVOLUTION_API_URL}/message/sendMedia/${instanceId}`,
       {
         number: phoneNumber,
         mediatype: 'audio',
@@ -201,7 +226,7 @@ async function sendAudioMessage(phoneNumber, audioPath) {
       }
     );
     
-    console.log(`✅ Audio enviado a ${phoneNumber}`);
+    console.log(`✅ Audio enviado a ${phoneNumber} (desde instancia ${instanceId})`);
     return response.data;
   } catch (err) {
     console.error(`❌ Error enviando audio a ${phoneNumber}:`, err.message);
@@ -212,18 +237,18 @@ async function sendAudioMessage(phoneNumber, audioPath) {
 /**
  * Envía mensaje + audio con latencia
  */
-async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = 120000) {
+async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = 120000, instanceId = INSTANCE_ID) {
   try {
     // Enviar mensaje de texto
     const formattedMessage = message.replace('{nombre}', leadName);
-    await sendTextMessage(phoneNumber, formattedMessage);
+    await sendTextMessage(phoneNumber, formattedMessage, instanceId);
     
     // Esperar 120 segundos
     console.log(`⏱️  Esperando ${delay / 1000} segundos antes de enviar audio...`);
     await new Promise(resolve => setTimeout(resolve, delay));
     
     // Enviar audio
-    await sendAudioMessage(phoneNumber, audioPath);
+    await sendAudioMessage(phoneNumber, audioPath, instanceId);
     
     return {
       success: true,
@@ -303,7 +328,15 @@ app.post('/webhook/ghl', async (req, res) => {
       console.log(`📌 Asignado a: Carolina (Tricalén)`);
     }
     
-    const phoneNumber = getExecutivePhone(executiveName);
+    // El destinatario del mensaje es el LEAD, no el ejecutivo
+    const phoneNumber = formatPhoneNumber(contactPhone);
+    if (!phoneNumber) {
+      console.error('❌ No se pudo formatear el número del lead:', contactPhone);
+      return res.status(400).json({ error: 'Número de teléfono del lead inválido' });
+    }
+    
+    // La instancia de WhatsApp desde la que se envía es la del ejecutivo asignado
+    const instanceId = getExecutiveInstance(executiveName);
     
     // Determinar segmento (Calificado / Poco Pie) según respuesta de presupuesto
     // Solo aplica para Volkania por ahora; Tricalén usa audio por defecto
@@ -321,7 +354,8 @@ app.post('/webhook/ghl', async (req, res) => {
       contactName,
       message,
       audioPath,
-      120000
+      120000,
+      instanceId
     ).catch(err => {
       console.error('Error en envío de mensaje/audio:', err.message);
     });
