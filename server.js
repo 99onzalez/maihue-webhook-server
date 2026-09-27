@@ -232,15 +232,12 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
     const audioBuffer = fs.readFileSync(audioPath);
     const base64Audio = audioBuffer.toString('base64');
     
+    // Endpoint específico para notas de voz (PTT) — distinto de sendMedia
     const response = await axios.post(
-      `${EVOLUTION_API_URL}/message/sendMedia/${instanceId}`,
+      `${EVOLUTION_API_URL}/message/sendWhatsAppAudio/${instanceId}`,
       {
         number: phoneNumber,
-        mediatype: 'audio',
-        mimetype: 'audio/ogg; codecs=opus',
-        ptt: true,
-        media: base64Audio,
-        fileName: 'audio.ogg'
+        audio: base64Audio
       },
       {
         headers: {
@@ -251,6 +248,7 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
     );
     
     console.log(`✅ Audio enviado a ${phoneNumber} (desde instancia ${instanceId})`);
+    console.log('📋 Respuesta de Evolution API:', JSON.stringify(response.data));
     return response.data;
   } catch (err) {
     console.error(`❌ Error enviando audio a ${phoneNumber}:`, err.message);
