@@ -63,10 +63,8 @@ const FORM_URLS = {
 
 // Audios por segmento (ruta dentro del contenedor de Railway)
 // "Poco Pie" usa el audio que ya tenemos. "Calificado" se sube más adelante.
-const AUDIO_PATHS = {
-  calificado: process.env.AUDIO_PATH_CALIFICADO || '/app/audios/audio_calificado.mp3',
-  poco_pie: process.env.AUDIO_PATH_POCO_PIE || '/app/audios/audio_pdo_gerardo.mp3'
-};
+// Carpeta base de audios, organizada por ejecutivo: audios/{ejecutivo}/ogg/{segmento}.ogg
+const AUDIO_BASE_PATH = process.env.AUDIO_BASE_PATH || '/app/audios';
 
 // Valores exactos que llegan desde el formulario de Meta (pregunta de presupuesto)
 const BUDGET_VALUES = {
@@ -105,13 +103,20 @@ function getSegment(budgetAnswer, tags) {
 /**
  * Obtiene la ruta de audio correcta, con fallback si el archivo aún no existe
  */
-function getAudioPath(segment) {
-  const audioPath = AUDIO_PATHS[segment] || AUDIO_PATHS.poco_pie;
-  if (!fs.existsSync(audioPath)) {
-    console.warn(`⚠️  Audio de "${segment}" no encontrado en ${audioPath}, usando audio de respaldo`);
-    return AUDIO_PATHS.poco_pie;
-  }
-  return audioPath;
+function getAudioPath(executiveName, segment) {
+  const primary = `${AUDIO_BASE_PATH}/${executiveName}/ogg/${segment}.ogg`;
+  if (fs.existsSync(primary)) return primary;
+  
+  console.warn(`⚠️  No hay audio de "${segment}" para ${executiveName}, buscando respaldo...`);
+  
+  // Respaldo 1: el audio de Gerardo para ese mismo segmento
+  const fallbackSameSegment = `${AUDIO_BASE_PATH}/gerardo/ogg/${segment}.ogg`;
+  if (fs.existsSync(fallbackSameSegment)) return fallbackSameSegment;
+  
+  // Respaldo 2: el audio de "poco_pie" de Gerardo (el que siempre debería existir)
+  const finalFallback = `${AUDIO_BASE_PATH}/gerardo/ogg/poco_pie.ogg`;
+  console.warn(`⚠️  Usando audio de respaldo final: ${finalFallback}`);
+  return finalFallback;
 }
 
 // =====================
@@ -232,9 +237,10 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
       {
         number: phoneNumber,
         mediatype: 'audio',
-        mimetype: 'audio/mpeg',
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
         media: base64Audio,
-        fileName: 'mensaje_bienvenida.mp3'
+        fileName: 'audio.ogg'
       },
       {
         headers: {
@@ -365,7 +371,7 @@ app.post('/webhook/ghl', async (req, res) => {
     // Determinar segmento (Calificado / Poco Pie) según respuesta de presupuesto
     // Solo aplica para Volkania por ahora; Tricalén usa audio por defecto
     const segment = projectName === 'volkania' ? getSegment(budgetAnswer, tags) : 'poco_pie';
-    const audioPath = getAudioPath(segment);
+    const audioPath = getAudioPath(executiveName, segment);
     console.log(`💰 Segmento: ${segment} (respuesta: "${budgetAnswer || 'N/A'}")`);
     
     // Formatear mensaje (mismo mensaje para ambos segmentos)
@@ -440,7 +446,7 @@ app.post('/test/send-message', async (req, res) => {
  */
 app.post('/test/send-audio', async (req, res) => {
   try {
-    const { phoneNumber, segment } = req.body;
+    const { phoneNumber, segment, executive } = req.body;
     
     if (!phoneNumber) {
       return res.status(400).json({
@@ -448,12 +454,15 @@ app.post('/test/send-audio', async (req, res) => {
       });
     }
     
-    const audioPath = getAudioPath(segment === 'calificado' ? 'calificado' : 'poco_pie');
-    const result = await sendAudioMessage(phoneNumber, audioPath);
+    const executiveName = executive || 'gerardo';
+    const audioPath = getAudioPath(executiveName, segment === 'calificado' ? 'calificado' : 'poco_pie');
+    const instanceId = getExecutiveInstance(executiveName);
+    const result = await sendAudioMessage(phoneNumber, audioPath, instanceId);
     
     res.json({
       success: true,
       audioUsed: audioPath,
+      instanceUsed: instanceId,
       result
     });
   } catch (err) {
