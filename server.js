@@ -84,9 +84,20 @@ const SEGMENT_MESSAGES = {
   sin_urgencia: 'Hola {nombre}, gracias por tu interés en Volkania! Te dejo unos datos para que vayas viendo con calma 😊'
 };
 
-// Latencias del guion: texto 30 s después de llegar el webhook, audio 120 s después del texto
-const TEXT_DELAY_MS = 30000;
-const AUDIO_DELAY_MS = 120000;
+// Latencias (~30 s al texto, 50–60 s al audio), con variación aleatoria para que
+// los envíos no tengan un ritmo de máquina. Cada rango es [mínimo, máximo] en milisegundos.
+const TEXT_DELAY_RANGE = [25000, 40000];   // webhook → texto al lead
+const AUDIO_DELAY_RANGE = [50000, 60000];  // texto → audio al lead (los audios duran 30–40 s)
+const NOTIFY_DELAY_RANGE = [5000, 15000];   // webhook → aviso al ejecutivo
+// Tiempo que Evolution muestra "escribiendo..." / "grabando audio..." antes de cada envío
+const TYPING_RANGE = [2500, 6000];
+const RECORDING_RANGE = [4000, 8000];
+
+function randomBetween([min, max]) {
+  return Math.round(min + Math.random() * (max - min));
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // Instancia "Maestra": avisa por WhatsApp al ejecutivo asignado cuando llega un lead (el lead no lo ve).
 // Si falta la instancia o el número del ejecutivo, el aviso se omite y queda registrado en el log.
@@ -167,6 +178,7 @@ async function notifyExecutive(executiveName, text) {
     return;
   }
   try {
+    await sleep(randomBetween(NOTIFY_DELAY_RANGE));
     await sendTextMessage(executivePhone, text, MAESTRA_INSTANCE);
     console.log(`🔔 Aviso enviado a ${executiveName} desde la Maestra`);
   } catch (err) {
@@ -274,7 +286,8 @@ async function sendTextMessage(phoneNumber, message, instanceId = INSTANCE_ID) {
       `${EVOLUTION_API_URL}/message/sendText/${instanceId}`,
       {
         number: phoneNumber,
-        text: message
+        text: message,
+        delay: randomBetween(TYPING_RANGE) // muestra "escribiendo..." antes de enviar
       },
       {
         headers: {
@@ -311,7 +324,8 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
       `${EVOLUTION_API_URL}/message/sendWhatsAppAudio/${instanceId}`,
       {
         number: phoneNumber,
-        audio: base64Audio
+        audio: base64Audio,
+        delay: randomBetween(RECORDING_RANGE) // muestra "grabando audio..." antes de enviar
       },
       {
         headers: {
@@ -333,11 +347,11 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
 /**
  * Envía mensaje + audio con latencia
  */
-async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = AUDIO_DELAY_MS, instanceId = INSTANCE_ID, textDelay = 0) {
+async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = randomBetween(AUDIO_DELAY_RANGE), instanceId = INSTANCE_ID, textDelay = 0) {
   try {
     if (textDelay > 0) {
       console.log(`⏱️  Esperando ${textDelay / 1000} segundos antes de enviar el texto...`);
-      await new Promise(resolve => setTimeout(resolve, textDelay));
+      await sleep(textDelay);
     }
 
     // Enviar mensaje de texto
@@ -346,7 +360,7 @@ async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, de
 
     // Esperar antes del audio
     console.log(`⏱️  Esperando ${delay / 1000} segundos antes de enviar audio (${path.basename(audioPath)})...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
+    await sleep(delay);
 
     // Enviar audio
     await sendAudioMessage(phoneNumber, audioPath, instanceId);
@@ -466,9 +480,9 @@ app.post('/webhook/ghl', async (req, res) => {
       contactName,
       message,
       audioPath,
-      AUDIO_DELAY_MS,
+      randomBetween(AUDIO_DELAY_RANGE),
       instanceId,
-      TEXT_DELAY_MS
+      randomBetween(TEXT_DELAY_RANGE)
     ).catch(err => {
       console.error('Error en envío de mensaje/audio:', err.message);
     });
