@@ -62,15 +62,46 @@ const FORM_URLS = {
 };
 
 // Audios por segmento (ruta dentro del contenedor de Railway)
-// "Poco Pie" usa el audio que ya tenemos. "Calificado" se sube más adelante.
 // Carpeta base de audios, organizada por ejecutivo: audios/{ejecutivo}/ogg/{segmento}.ogg
 const AUDIO_BASE_PATH = process.env.AUDIO_BASE_PATH || '/app/audios';
 
-// Valores exactos que llegan desde el formulario de Meta (pregunta de presupuesto)
-const BUDGET_VALUES = {
-  calificado: 'Más de $6.000.000',
-  poco_pie: 'Entre $4.000.000 y $6.000.000'
+// Macro-segmentos del guion aprobado (Guiones_Mensajes_Audio_Volkania.docx).
+// GHL decide el segmento poniendo un tag al contacto; el servidor solo lo traduce.
+// Si llegan varios tags, gana el primero de esta lista (prioridad).
+const SEGMENT_TAGS = {
+  contado: 'contado-volkania',
+  financiamiento: 'financiamiento-volkania',
+  sin_urgencia: 'sin-urgencia-volkania'
 };
+const SEGMENTS = Object.keys(SEGMENT_TAGS);
+// Sin tag reconocible: financiamiento es el mensaje más neutro (no asume contado ni falta de urgencia)
+const DEFAULT_SEGMENT = 'financiamiento';
+
+// Texto por segmento. El emoji final es el código interno para el ejecutivo.
+const SEGMENT_MESSAGES = {
+  contado: 'Hola {nombre}! Vi que llenaste el formulario de Volkania, gracias por el interés 👍',
+  financiamiento: 'Hola {nombre}, qué bueno que te interesó Volkania! Ya te mando más info por acá 🙌',
+  sin_urgencia: 'Hola {nombre}, gracias por tu interés en Volkania! Te dejo unos datos para que vayas viendo con calma 😊'
+};
+
+// Latencias del guion: texto 30 s después de llegar el webhook, audio 120 s después del texto
+const TEXT_DELAY_MS = 30000;
+const AUDIO_DELAY_MS = 120000;
+
+// Instancia "Maestra": avisa por WhatsApp al ejecutivo asignado cuando llega un lead (el lead no lo ve).
+// Si falta la instancia o el número del ejecutivo, el aviso se omite y queda registrado en el log.
+const MAESTRA_INSTANCE = process.env.INSTANCE_MAESTRA || null;
+const EXECUTIVE_PHONES = {
+  gerardo: process.env.PHONE_GERARDO,
+  josefina: process.env.PHONE_JOSEFINA,
+  carolina: process.env.PHONE_CAROLINA
+};
+const SEGMENT_LABELS = {
+  contado: '👍 Contado',
+  financiamiento: '🙌 Financiamiento',
+  sin_urgencia: '😊 Sin urgencia'
+};
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'ZgMWAqw0bvt3n7ZSg9mf';
 
 // Mapeo: ID de usuario "Assigned To" en GHL -> clave interna del ejecutivo
 // Ve a Settings → My Staff → click en el usuario → revisa la URL para obtener el ID
@@ -87,17 +118,60 @@ function mapOwnerToExecutive(assignedToId) {
   if (!assignedToId) return null;
   return OWNER_ID_MAP[assignedToId.trim()] || null;
 }
-function getSegment(budgetAnswer, tags) {
-  if (tags) {
-    const tagList = (Array.isArray(tags) ? tags : tags.split(',')).map(t => t.trim().toLowerCase());
-    if (tagList.includes('calificado-volkania')) return 'calificado';
-    if (tagList.includes('poco-pie-volkania')) return 'poco_pie';
+/**
+ * Traduce los tags del contacto (GHL los manda como "tag1, tag2" o como arreglo) a un macro-segmento.
+ * Devuelve { segment, matched }: matched = false cuando se usó el segmento por defecto.
+ */
+function getSegment(tags) {
+  const tagList = !tags ? [] : (Array.isArray(tags) ? tags : String(tags).split(','))
+    .map(t => String(t).trim().toLowerCase());
+  const segment = SEGMENTS.find(s => tagList.includes(SEGMENT_TAGS[s]));
+  if (segment) return { segment, matched: true };
+  console.warn(`⚠️  Ningún tag de segmento en [${tagList.join(', ')}], uso "${DEFAULT_SEGMENT}"`);
+  return { segment: DEFAULT_SEGMENT, matched: false };
+}
+
+/**
+ * Arma la notificación interna para el ejecutivo (normal o con advertencia de segmento faltante)
+ */
+function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId }) {
+  const link = contactId
+    ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`
+    : '(sin ID de contacto)';
+  if (!matched) {
+    return [
+      `⚠️ Nuevo lead SIN SEGMENTO — ${projectDisplay} 🙌`,
+      `👤 ${contactName} | 📱 +${phoneNumber}`,
+      `🏷️ Tags recibidos: ${tags || 'ninguno'} (ninguno de segmento)`,
+      `📨 Se le envió el mensaje y audio de Financiamiento (por defecto)`,
+      `👉 Revisa sus respuestas en GHL y corrige el tag antes de llamar`,
+      `🔗 ${link}`
+    ].join('\n');
   }
-  if (!budgetAnswer) return 'poco_pie'; // fallback seguro
-  const answer = budgetAnswer.trim();
-  if (answer === BUDGET_VALUES.calificado) return 'calificado';
-  if (answer === BUDGET_VALUES.poco_pie) return 'poco_pie';
-  return 'poco_pie'; // fallback si llega un valor inesperado
+  const emoji = SEGMENT_LABELS[segment].split(' ')[0];
+  return [
+    `🔔 Nuevo lead — ${projectDisplay} ${emoji}`,
+    `👤 ${contactName} | 📱 +${phoneNumber}`,
+    `🏷️ ${SEGMENT_LABELS[segment]}${budgetAnswer ? ` · pie: ${budgetAnswer}` : ''}`,
+    `🔗 ${link}`
+  ].join('\n');
+}
+
+/**
+ * Envía la notificación al ejecutivo desde la instancia Maestra (nunca bloquea el flujo del lead)
+ */
+async function notifyExecutive(executiveName, text) {
+  const executivePhone = formatPhoneNumber(EXECUTIVE_PHONES[executiveName]);
+  if (!MAESTRA_INSTANCE || !executivePhone) {
+    console.warn(`⚠️  Aviso al ejecutivo omitido (INSTANCE_MAESTRA: ${MAESTRA_INSTANCE ? 'ok' : 'falta'}, teléfono de ${executiveName}: ${executivePhone ? 'ok' : 'falta'})`);
+    return;
+  }
+  try {
+    await sendTextMessage(executivePhone, text, MAESTRA_INSTANCE);
+    console.log(`🔔 Aviso enviado a ${executiveName} desde la Maestra`);
+  } catch (err) {
+    console.error(`❌ No se pudo avisar a ${executiveName}:`, err.message);
+  }
 }
 
 /**
@@ -113,8 +187,8 @@ function getAudioPath(executiveName, segment) {
   const fallbackSameSegment = `${AUDIO_BASE_PATH}/gerardo/ogg/${segment}.ogg`;
   if (fs.existsSync(fallbackSameSegment)) return fallbackSameSegment;
   
-  // Respaldo 2: el audio de "poco_pie" de Gerardo (el que siempre debería existir)
-  const finalFallback = `${AUDIO_BASE_PATH}/gerardo/ogg/poco_pie.ogg`;
+  // Respaldo 2: el audio de financiamiento de Gerardo (el más neutro)
+  const finalFallback = `${AUDIO_BASE_PATH}/gerardo/ogg/${DEFAULT_SEGMENT}.ogg`;
   console.warn(`⚠️  Usando audio de respaldo final: ${finalFallback}`);
   return finalFallback;
 }
@@ -259,16 +333,21 @@ async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID
 /**
  * Envía mensaje + audio con latencia
  */
-async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = 120000, instanceId = INSTANCE_ID) {
+async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, delay = AUDIO_DELAY_MS, instanceId = INSTANCE_ID, textDelay = 0) {
   try {
+    if (textDelay > 0) {
+      console.log(`⏱️  Esperando ${textDelay / 1000} segundos antes de enviar el texto...`);
+      await new Promise(resolve => setTimeout(resolve, textDelay));
+    }
+
     // Enviar mensaje de texto
     const formattedMessage = message.replace('{nombre}', leadName);
     await sendTextMessage(phoneNumber, formattedMessage, instanceId);
-    
-    // Esperar 120 segundos
-    console.log(`⏱️  Esperando ${delay / 1000} segundos antes de enviar audio...`);
+
+    // Esperar antes del audio
+    console.log(`⏱️  Esperando ${delay / 1000} segundos antes de enviar audio (${path.basename(audioPath)})...`);
     await new Promise(resolve => setTimeout(resolve, delay));
-    
+
     // Enviar audio
     await sendAudioMessage(phoneNumber, audioPath, instanceId);
     
@@ -319,9 +398,10 @@ app.post('/webhook/ghl', async (req, res) => {
       formUrl,
       project,
       budgetAnswer,
-      assignedTo,
-      tags
+      assignedTo
     } = payload;
+    // GHL manda los tags del contacto en la raíz del body, no dentro de customData
+    const tags = req.body.tags ?? payload.tags;
     
     // Validar datos mínimos
     if (!contactName || !contactPhone) {
@@ -366,27 +446,44 @@ app.post('/webhook/ghl', async (req, res) => {
     // La instancia de WhatsApp desde la que se envía es la del ejecutivo asignado
     const instanceId = getExecutiveInstance(executiveName);
     
-    // Determinar segmento (Calificado / Poco Pie) según respuesta de presupuesto
-    // Solo aplica para Volkania por ahora; Tricalén usa audio por defecto
-    const segment = projectName === 'volkania' ? getSegment(budgetAnswer, tags) : 'poco_pie';
+    // Determinar segmento según el tag que GHL puso al contacto
+    // Solo aplica para Volkania por ahora; Tricalén usa el segmento por defecto y un texto genérico
+    const { segment, matched } = projectName === 'volkania'
+      ? getSegment(tags)
+      : { segment: DEFAULT_SEGMENT, matched: true };
     const audioPath = getAudioPath(executiveName, segment);
-    console.log(`💰 Segmento: ${segment} (respuesta: "${budgetAnswer || 'N/A'}")`);
-    
-    // Formatear mensaje (mismo mensaje para ambos segmentos)
+    console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${budgetAnswer || 'N/A'}") → audio ${audioPath}`);
+
+    // Formatear mensaje según segmento
     const projectDisplay = projectName.charAt(0).toUpperCase() + projectName.slice(1);
-    const message = `Hola ${contactName}, gracias por tu interés en ${projectDisplay}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
-    
+    const message = projectName === 'volkania'
+      ? SEGMENT_MESSAGES[segment]
+      : `Hola {nombre}, gracias por tu interés en ${projectDisplay}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
+
     // Enviar mensaje + audio (async, no esperar respuesta)
     sendMessageAndAudio(
       phoneNumber,
       contactName,
       message,
       audioPath,
-      120000,
-      instanceId
+      AUDIO_DELAY_MS,
+      instanceId,
+      TEXT_DELAY_MS
     ).catch(err => {
       console.error('Error en envío de mensaje/audio:', err.message);
     });
+
+    // Aviso interno al ejecutivo desde la Maestra (en paralelo, no espera al lead)
+    notifyExecutive(executiveName, buildExecutiveNotification({
+      projectDisplay,
+      segment,
+      matched,
+      contactName,
+      phoneNumber,
+      tags,
+      budgetAnswer,
+      contactId: req.body.contact_id || contactId
+    }));
     
     // Responder inmediatamente a GHL
     res.json({
@@ -453,7 +550,7 @@ app.post('/test/send-audio', async (req, res) => {
     }
     
     const executiveName = executive || 'gerardo';
-    const audioPath = getAudioPath(executiveName, segment === 'calificado' ? 'calificado' : 'poco_pie');
+    const audioPath = getAudioPath(executiveName, SEGMENTS.includes(segment) ? segment : DEFAULT_SEGMENT);
     const instanceId = getExecutiveInstance(executiveName);
     const result = await sendAudioMessage(phoneNumber, audioPath, instanceId);
     
