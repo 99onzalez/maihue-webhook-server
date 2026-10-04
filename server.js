@@ -5,9 +5,11 @@ const axios = require('axios');
 const redis = require('redis');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
 // =====================
 // CONFIGURACIÓN
@@ -24,18 +26,20 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || 'sua-api-key-aqui';
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || 'tu-secret-aqui';
 
 // Instancia de Evolution API (WhatsApp) por ejecutivo — cada uno envía desde SU propio número.
-// Nunca se envía desde el número de otro ejecutivo: si la instancia no está conectada, no se envía
-// nada al lead (ver isInstanceOpen) y el ejecutivo lo contacta a mano con la notificación de GHL.
+// "central" es el WhatsApp de Maihue Central: último respaldo de la cadena (ver assignBySchedule).
 const EXECUTIVE_INSTANCES = {
   gerardo: process.env.INSTANCE_GERARDO || INSTANCE_ID,
   josefina: process.env.INSTANCE_JOSEFINA || 'Josefina',
-  carolina: process.env.INSTANCE_CAROLINA || 'Carolina'
+  carolina: process.env.INSTANCE_CAROLINA || 'Carolina',
+  central: process.env.INSTANCE_CENTRAL || 'Central'
 };
 const EXECUTIVE_DISPLAY_NAMES = {
   gerardo: 'Gerardo',
   josefina: 'Josefina',
-  carolina: 'Carolina'
+  carolina: 'Carolina',
+  central: 'Central'
 };
+const CENTRAL_EXECUTIVE = 'central';
 
 /**
  * Limpia y formatea un número de teléfono al formato que espera Evolution API
@@ -99,6 +103,9 @@ const CYBER_SEGMENT_TAGS = {
 };
 const CYBER_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribe {ejecutivo}, del equipo de Maihue. Recibí tu registro en el Cyber de {proyecto} 🙂 Te acabo de dejar un audio con los detalles. ¿Qué día te acomoda visitar el proyecto? {emoji}';
 const CYBER_AUDIO_FILE = 'cyber';
+// Desde Central sale solo texto (sin audio), firmado por el equipo de Maihue
+const CENTRAL_CYBER_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribimos del equipo de Maihue. Recibimos tu registro en el Cyber de {proyecto} 🙂 Te recordamos las condiciones: $1.000.000 de descuento en cualquier parcela, con cualquier medio de pago y acumulable con el precio al contado. Son solo 3 cupos en total entre Volkania y Tricalén, y para hacerlo válido debes agendar tu visita y comprar durante octubre (hasta el 31 de octubre). ¿Qué día te acomoda visitar el proyecto? {emoji}';
+const CENTRAL_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribimos del equipo de Maihue. Recibimos tu registro en {proyecto} 🙂 ¿Qué día te acomoda visitar el proyecto?';
 const PROJECT_DISPLAY_NAMES = {
   volkania: 'Volkania',
   tricalen: 'Tricalén'
@@ -125,7 +132,8 @@ const MAESTRA_INSTANCE = process.env.INSTANCE_MAESTRA || null;
 const EXECUTIVE_PHONES = {
   gerardo: process.env.PHONE_GERARDO,
   josefina: process.env.PHONE_JOSEFINA,
-  carolina: process.env.PHONE_CAROLINA
+  carolina: process.env.PHONE_CAROLINA,
+  central: process.env.PHONE_CENTRAL
 };
 const SEGMENT_LABELS = {
   contado: '👍 Contado',
@@ -180,7 +188,8 @@ function executivesOnShift(date = new Date()) {
 const OWNER_ID_MAP = {
   'xfGUbyF37C0bBtsNGHgb': 'gerardo',
   'vGsKBT2O5dDRwH8OZOtj': 'josefina',
-  'o38VaOWN6Cjzdsmd66JH': 'carolina'
+  'o38VaOWN6Cjzdsmd66JH': 'carolina',
+  'HlToqIEm89vSAJHzah7M': 'central'
 };
 
 /**
@@ -206,18 +215,25 @@ function getSegment(tags, segmentTags = SEGMENT_TAGS) {
 /**
  * Arma la notificación interna para el ejecutivo (normal o con advertencia de segmento faltante)
  */
-function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId, sent = true }) {
+function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId, sent = true, answers = {} }) {
   const link = contactId
     ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`
     : '(sin ID de contacto)';
+  // Respuestas del formulario que llegaron en el webhook
+  const answerLine = [
+    answers.visita && `visita: ${answers.visita}`,
+    answers.pago && `pago: ${answers.pago}`,
+    budgetAnswer && `pie: ${budgetAnswer}`
+  ].filter(Boolean).join(' · ');
   if (!sent) {
     return [
-      `⚠️ Nuevo lead — ${projectDisplay} ${SEGMENT_LABELS[segment].split(' ')[0]}`,
+      `⚠️ Lead SIN CONTACTAR — ${projectDisplay} ${SEGMENT_LABELS[segment].split(' ')[0]}`,
       `👤 ${contactName} | 📱 +${phoneNumber}`,
       `🏷️ ${SEGMENT_LABELS[segment]}`,
-      `📵 NO se le envió WhatsApp automático: tu número no está conectado. Escríbele a mano.`,
+      answerLine && `📝 ${answerLine}`,
+      `📵 NO se le envió WhatsApp automático: nadie estaba disponible (WhatsApp desconectado o marcado ausente). Escríbele a mano.`,
       `🔗 ${link}`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
   if (!matched) {
     return [
@@ -233,9 +249,10 @@ function buildExecutiveNotification({ projectDisplay, segment, matched, contactN
   return [
     `🔔 Nuevo lead — ${projectDisplay} ${emoji}`,
     `👤 ${contactName} | 📱 +${phoneNumber}`,
-    `🏷️ ${SEGMENT_LABELS[segment]}${budgetAnswer ? ` · pie: ${budgetAnswer}` : ''}`,
+    `🏷️ ${SEGMENT_LABELS[segment]}`,
+    answerLine && `📝 ${answerLine}`,
     `🔗 ${link}`
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 /**
@@ -316,8 +333,62 @@ function identifyProject(formUrl) {
 }
 
 /**
- * Elige al ejecutivo según el horario de trabajo. Si hay más de una persona de turno con su
- * WhatsApp conectado, se alternan (el último asignado queda en Redis).
+ * Interruptor manual de disponibilidad (página /disponibilidad). La ausencia queda en Redis
+ * (sobrevive a reinicios y deploys); "solo por hoy" expira sola a medianoche, hora de Chile.
+ */
+const ABSENCE_KEY_PREFIX = 'availability:absent:';
+const absentInMemory = new Map(); // respaldo si Redis no responde: ejecutivo -> vence (ms) o null
+
+function secondsUntilChileMidnight(date = new Date()) {
+  return Math.max(60, (24 * 60 - chileMinutes(date)) * 60 - date.getSeconds());
+}
+
+// mode: "hoy" (hasta las 23:59), "indefinido" (hasta reactivar) o "disponible"
+async function setAbsence(executive, mode) {
+  const key = ABSENCE_KEY_PREFIX + executive;
+  if (mode === 'disponible') {
+    absentInMemory.delete(executive);
+    await withTimeout(redisClient.del(key)).catch(() => { /* usamos la memoria */ });
+    return;
+  }
+  const ttl = mode === 'hoy' ? secondsUntilChileMidnight() : null;
+  absentInMemory.set(executive, ttl ? Date.now() + ttl * 1000 : null);
+  await withTimeout(ttl ? redisClient.set(key, mode, { EX: ttl }) : redisClient.set(key, mode))
+    .catch(() => { /* usamos la memoria */ });
+}
+
+// null si está disponible; "hoy" o "indefinido" si está marcado ausente
+async function getAbsence(executive) {
+  try {
+    return await withTimeout(redisClient.get(ABSENCE_KEY_PREFIX + executive));
+  } catch (err) {
+    if (!absentInMemory.has(executive)) return null;
+    const until = absentInMemory.get(executive);
+    if (until && until < Date.now()) {
+      absentInMemory.delete(executive);
+      return null;
+    }
+    return until ? 'hoy' : 'indefinido';
+  }
+}
+
+// Disponible = no marcado ausente y con su WhatsApp conectado
+async function isAvailable(executive) {
+  const absence = await getAbsence(executive);
+  if (absence) {
+    console.warn(`🔕 ${executive} está marcado ausente (${absence})`);
+    return false;
+  }
+  return isInstanceOpen(getExecutiveInstance(executive));
+}
+
+/**
+ * Cadena de asignación (permanente):
+ *   1. Ejecutivas de turno disponibles (si hay varias, se alternan; el último queda en Redis)
+ *   2. Gerardo, si está disponible
+ *   3. Central (solo texto), si está disponible
+ *   4. Nadie: no se envía WhatsApp; queda en Gerardo y la Maestra avisa a Gerardo y a Central
+ * Devuelve { executive, sent }.
  */
 const SCHEDULE_ROTATION_KEY = 'schedule:round_robin:last';
 let lastScheduledInMemory = null; // respaldo si Redis no responde
@@ -326,20 +397,25 @@ async function assignBySchedule(date = new Date()) {
   const onShift = executivesOnShift(date);
   const available = [];
   for (const executive of onShift) {
-    if (await isInstanceOpen(getExecutiveInstance(executive))) available.push(executive);
+    if (await isAvailable(executive)) available.push(executive);
   }
-  if (available.length === 0) {
-    if (onShift.length) console.warn(`⚠️  De turno: ${onShift.join(', ')}, pero sin WhatsApp conectado → ${SCHEDULE_DEFAULT_EXECUTIVE}`);
-    return SCHEDULE_DEFAULT_EXECUTIVE;
+  if (available.length === 1) return { executive: available[0], sent: true };
+  if (available.length > 1) {
+    let last = lastScheduledInMemory;
+    try { last = (await withTimeout(redisClient.get(SCHEDULE_ROTATION_KEY))) || last; } catch (err) { /* usamos la memoria */ }
+    const next = available[(available.indexOf(last) + 1) % available.length];
+    lastScheduledInMemory = next;
+    withTimeout(redisClient.set(SCHEDULE_ROTATION_KEY, next)).catch(() => { /* usamos la memoria */ });
+    return { executive: next, sent: true };
   }
-  if (available.length === 1) return available[0];
-
-  let last = lastScheduledInMemory;
-  try { last = (await withTimeout(redisClient.get(SCHEDULE_ROTATION_KEY))) || last; } catch (err) { /* usamos la memoria */ }
-  const next = available[(available.indexOf(last) + 1) % available.length];
-  lastScheduledInMemory = next;
-  withTimeout(redisClient.set(SCHEDULE_ROTATION_KEY, next)).catch(() => { /* usamos la memoria */ });
-  return next;
+  if (onShift.length) console.warn(`⚠️  De turno: ${onShift.join(', ')}, pero ninguna disponible → respaldo`);
+  if (await isAvailable(SCHEDULE_DEFAULT_EXECUTIVE)) return { executive: SCHEDULE_DEFAULT_EXECUTIVE, sent: true };
+  if (await isAvailable(CENTRAL_EXECUTIVE)) {
+    console.warn(`⚠️  ${SCHEDULE_DEFAULT_EXECUTIVE} no disponible → Central`);
+    return { executive: CENTRAL_EXECUTIVE, sent: true };
+  }
+  console.warn('📵 Nadie disponible (ni Central): el lead queda sin WhatsApp automático');
+  return { executive: SCHEDULE_DEFAULT_EXECUTIVE, sent: false };
 }
 
 // Si Redis está caído, el cliente deja los comandos en cola indefinidamente; no esperamos más de 2 s.
@@ -628,16 +704,20 @@ app.post('/webhook/ghl', async (req, res) => {
     
     // Asignar ejecutivo: si GHL ya trae un owner reconocible (asignación manual o prueba), se respeta;
     // si no, decide el horario de trabajo y el servidor lo escribe de vuelta en GHL.
+    // Si ese owner no está disponible, se aplica la misma cadena de respaldo.
     let executiveName = mapOwnerToExecutive(assignedTo);
+    let sent = true;
     const ghlContactId = req.body.contact_id || contactId;
 
-    if (executiveName) {
+    if (executiveName && await isAvailable(executiveName)) {
       console.log(`👤 Ejecutivo tomado del Owner asignado en GHL: ${executiveName}`);
     } else {
-      executiveName = await assignBySchedule();
-      console.log(`🕒 Asignado por horario: ${executiveName}`);
+      if (executiveName) console.warn(`⚠️  Owner de GHL ${executiveName} no disponible → cadena de respaldo`);
+      ({ executive: executiveName, sent } = await assignBySchedule());
+      console.log(`🕒 Asignado por horario: ${executiveName}${sent ? '' : ' (sin envío automático)'}`);
       assignOwnerInGhl({ contactId: ghlContactId, opportunityId, executiveName });
     }
+    const isCentral = executiveName === CENTRAL_EXECUTIVE;
     
     // El destinatario del mensaje es el LEAD, no el ejecutivo
     const phoneNumber = formatPhoneNumber(contactPhone);
@@ -665,8 +745,8 @@ app.post('/webhook/ghl', async (req, res) => {
       } else {
         ({ segment, matched } = getSegment(tags, CYBER_SEGMENT_TAGS));
       }
-      audioPath = getCyberAudioPath(executiveName);
-      message = CYBER_MESSAGE
+      audioPath = isCentral ? null : getCyberAudioPath(executiveName);
+      message = (isCentral ? CENTRAL_CYBER_MESSAGE : CYBER_MESSAGE)
         .replace('{ejecutivo}', EXECUTIVE_DISPLAY_NAMES[executiveName])
         .replace('{proyecto}', projectBase)
         .replace('{emoji}', SEGMENT_LABELS[segment].split(' ')[0]);
@@ -676,17 +756,17 @@ app.post('/webhook/ghl', async (req, res) => {
       ({ segment, matched } = projectKey === 'volkania'
         ? getSegment(tags)
         : { segment: DEFAULT_SEGMENT, matched: true });
-      audioPath = getAudioPath(executiveName, segment);
-      message = projectKey === 'volkania'
+      audioPath = isCentral ? null : getAudioPath(executiveName, segment);
+      if (isCentral) message = CENTRAL_MESSAGE.replace('{proyecto}', projectBase);
+      else message = projectKey === 'volkania'
         ? SEGMENT_MESSAGES[segment]
         : `Hola {nombre}, gracias por tu interés en ${projectBase}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
     }
     console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${pieAnswer || 'N/A'}") → audio ${audioPath || 'ninguno'}`);
 
-    // Envío en segundo plano: primero se confirma que el WhatsApp del ejecutivo esté conectado.
-    // Si no lo está, no se envía nada desde otro número; solo se avisa al ejecutivo.
+    // Envío en segundo plano. La disponibilidad ya se revisó al asignar; si nadie estaba
+    // disponible (sent = false), no se envía nada y la Maestra avisa a Gerardo y a Central.
     (async () => {
-      const sent = await isInstanceOpen(instanceId);
       if (sent) {
         sendMessageAndAudio(
           phoneNumber,
@@ -700,11 +780,11 @@ app.post('/webhook/ghl', async (req, res) => {
           console.error('Error en envío de mensaje/audio:', err.message);
         });
       } else {
-        console.warn(`📵 No se envía WhatsApp a ${contactName}: la instancia de ${executiveName} (${instanceId}) no está conectada`);
+        console.warn(`📵 No se envía WhatsApp a ${contactName}: nadie disponible`);
       }
 
-      // Aviso interno al ejecutivo desde la Maestra (en paralelo, no espera al lead)
-      notifyExecutive(executiveName, buildExecutiveNotification({
+      // Aviso interno desde la Maestra (en paralelo, no espera al lead)
+      const notification = buildExecutiveNotification({
         projectDisplay,
         segment,
         matched,
@@ -713,8 +793,11 @@ app.post('/webhook/ghl', async (req, res) => {
         tags,
         budgetAnswer: pieAnswer,
         contactId: ghlContactId,
-        sent
-      }));
+        sent,
+        answers: { visita, pago }
+      });
+      const recipients = sent ? [executiveName] : [SCHEDULE_DEFAULT_EXECUTIVE, CENTRAL_EXECUTIVE];
+      recipients.forEach(r => notifyExecutive(r, notification));
     })();
     
     // Responder inmediatamente a GHL
@@ -727,6 +810,7 @@ app.post('/webhook/ghl', async (req, res) => {
         segment,
         campaign: isCyber ? 'cyber' : 'regular',
         assignedExecutive: executiveName,
+        autoMessage: sent,
         opportunityId
       }
     });
@@ -801,6 +885,88 @@ app.post('/test/send-audio', async (req, res) => {
 });
 
 /**
+ * Página de disponibilidad: marcar a alguien ausente (solo hoy / hasta reactivar) o disponible.
+ * Se entra con la clave ADMIN_KEY (variable de Railway); queda guardada en una cookie del navegador.
+ */
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+const ADMIN_COOKIE = 'maihue_admin';
+const ABSENCE_MODE_LABELS = { hoy: 'ausente solo por hoy (hasta las 23:59)', indefinido: 'ausente hasta que lo reactives', disponible: 'disponible' };
+
+function isAdmin(req) {
+  if (!ADMIN_KEY) return false;
+  const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
+    .find(c => c.startsWith(`${ADMIN_COOKIE}=`));
+  const value = cookie ? decodeURIComponent(cookie.slice(ADMIN_COOKIE.length + 1)) : '';
+  const a = Buffer.from(value);
+  const b = Buffer.from(ADMIN_KEY);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+function adminPage(body) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Disponibilidad Maihue</title><style>
+body{font-family:system-ui,sans-serif;background:#f5f5f4;color:#1c1917;margin:0;padding:16px;max-width:560px;margin-inline:auto}
+h1{font-size:1.3rem;margin:0 0 4px}.sub{color:#78716c;margin:0 0 16px;font-size:.9rem}
+.card{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;box-shadow:0 1px 3px #0001}
+.name{font-weight:700;font-size:1.05rem}.state{font-size:.9rem;margin:4px 0 10px;color:#44403c}
+form{display:inline}button{border:0;border-radius:8px;padding:9px 12px;margin:3px 4px 0 0;font-size:.9rem;cursor:pointer}
+.off{background:#fee2e2;color:#991b1b}.on{background:#dcfce7;color:#166534}.key{background:#F15A24;color:#fff}
+input{padding:10px;border:1px solid #d6d3d1;border-radius:8px;font-size:1rem;width:100%;box-sizing:border-box;margin-bottom:8px}
+</style></head><body>${body}</body></html>`;
+}
+
+app.get('/disponibilidad', async (req, res) => {
+  if (!ADMIN_KEY) return res.status(503).send(adminPage('<h1>Página desactivada</h1><p class="sub">Falta la variable ADMIN_KEY en Railway.</p>'));
+  if (!isAdmin(req)) {
+    return res.send(adminPage(`<h1>Disponibilidad Maihue</h1><p class="sub">Ingresa la clave de administración.</p>
+<div class="card"><form method="post" action="/disponibilidad/login"><input type="password" name="key" autocomplete="current-password" required>
+<button class="key" type="submit">Entrar</button></form></div>`));
+  }
+  const minutes = chileMinutes();
+  const onShift = executivesOnShift();
+  const rows = await Promise.all(Object.keys(EXECUTIVE_INSTANCES).map(async executive => {
+    const [absence, open] = await Promise.all([getAbsence(executive), isInstanceOpen(getExecutiveInstance(executive))]);
+    const shift = WORK_SCHEDULE.find(w => w.executive === executive);
+    const fmt = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+    const shiftText = shift ? `turno ${fmt(shift.start)}–${fmt(shift.end)}${onShift.includes(executive) ? ' · de turno ahora' : ''}`
+      : executive === CENTRAL_EXECUTIVE ? 'último respaldo' : 'fuera de los turnos de las ejecutivas';
+    const icon = absence ? '🔕' : open ? '🟢' : '🔴';
+    const stateText = absence ? ABSENCE_MODE_LABELS[absence] : open ? 'WhatsApp conectado' : 'WhatsApp desconectado';
+    const button = (mode, label, cls) => `<form method="post" action="/disponibilidad"><input type="hidden" name="executive" value="${executive}">
+<input type="hidden" name="mode" value="${mode}"><button class="${cls}" type="submit">${label}</button></form>`;
+    const actions = absence
+      ? button('disponible', 'Marcar disponible', 'on')
+      : button('hoy', 'Ausente solo hoy', 'off') + button('indefinido', 'Ausente hasta reactivar', 'off');
+    return `<div class="card"><div class="name">${icon} ${escapeHtml(EXECUTIVE_DISPLAY_NAMES[executive])}</div>
+<div class="state">${escapeHtml(stateText)} · ${escapeHtml(shiftText)}</div>${actions}</div>`;
+  }));
+  res.send(adminPage(`<h1>Disponibilidad Maihue</h1><p class="sub">Hora de Chile: ${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')} · <a href="/disponibilidad">actualizar</a></p>${rows.join('')}`));
+});
+
+app.post('/disponibilidad/login', (req, res) => {
+  const key = String(req.body.key || '');
+  const ok = ADMIN_KEY && key.length === ADMIN_KEY.length && crypto.timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_KEY));
+  if (!ok) return res.status(401).send(adminPage('<h1>Clave incorrecta</h1><p class="sub"><a href="/disponibilidad">Volver</a></p>'));
+  res.setHeader('Set-Cookie', `${ADMIN_COOKIE}=${encodeURIComponent(key)}; Path=/disponibilidad; HttpOnly; Secure; SameSite=Strict; Max-Age=${60 * 60 * 24 * 180}`);
+  res.redirect(303, '/disponibilidad');
+});
+
+app.post('/disponibilidad', async (req, res) => {
+  if (!isAdmin(req)) return res.status(401).send(adminPage('<h1>Sin acceso</h1><p class="sub"><a href="/disponibilidad">Entrar</a></p>'));
+  const { executive, mode } = req.body;
+  if (!EXECUTIVE_INSTANCES[executive] || !ABSENCE_MODE_LABELS[mode]) return res.status(400).send(adminPage('<h1>Datos inválidos</h1>'));
+  await setAbsence(executive, mode);
+  console.log(`🔕 Disponibilidad: ${executive} → ${mode}`);
+  const icon = mode === 'disponible' ? '🟢' : '🔕';
+  notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE, `${icon} ${EXECUTIVE_DISPLAY_NAMES[executive]} quedó ${ABSENCE_MODE_LABELS[mode]}`);
+  res.redirect(303, '/disponibilidad');
+});
+
+/**
  * Ver a quién se asignaría un lead ahora (o en ?at=2026-10-05T15:30:00-03:00), sin asignar ni enviar nada
  */
 app.get('/debug/schedule', async (req, res) => {
@@ -812,6 +978,9 @@ app.get('/debug/schedule', async (req, res) => {
       chileTime: `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`,
       schedule: WORK_SCHEDULE,
       onShift: executivesOnShift(date),
+      absent: Object.fromEntries(await Promise.all(
+        Object.keys(EXECUTIVE_INSTANCES).map(async e => [e, await getAbsence(e)])
+      )),
       wouldAssign: await assignBySchedule(date)
     });
   } catch (err) {
@@ -838,4 +1007,5 @@ app.listen(PORT, () => {
   console.log('  POST /test/send-message');
   console.log('  POST /test/send-audio');
   console.log('  GET  /debug/schedule');
+  console.log('  GET  /disponibilidad');
 });
