@@ -23,12 +23,18 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || 'sua-api-key-aqui';
 // GHL Webhook Secret
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || 'tu-secret-aqui';
 
-// Instancia de Evolution API (WhatsApp) por ejecutivo — cada uno envía desde SU propio número
-// Mientras Josefina y Carolina no tengan su número conectado, usamos la de Gerardo como respaldo
+// Instancia de Evolution API (WhatsApp) por ejecutivo — cada uno envía desde SU propio número.
+// Nunca se envía desde el número de otro ejecutivo: si la instancia no está conectada, no se envía
+// nada al lead (ver isInstanceOpen) y el ejecutivo lo contacta a mano con la notificación de GHL.
 const EXECUTIVE_INSTANCES = {
   gerardo: process.env.INSTANCE_GERARDO || INSTANCE_ID,
-  josefina: process.env.INSTANCE_JOSEFINA || INSTANCE_ID, // pendiente: conectar número propio
-  carolina: process.env.INSTANCE_CAROLINA || INSTANCE_ID  // pendiente: conectar número propio
+  josefina: process.env.INSTANCE_JOSEFINA || 'Josefina',
+  carolina: process.env.INSTANCE_CAROLINA || 'Carolina'
+};
+const EXECUTIVE_DISPLAY_NAMES = {
+  gerardo: 'Gerardo',
+  josefina: 'Josefina',
+  carolina: 'Carolina'
 };
 
 /**
@@ -84,6 +90,20 @@ const SEGMENT_MESSAGES = {
   sin_urgencia: 'Hola {nombre}, gracias por tu interés en Volkania! Te dejo unos datos para que vayas viendo con calma 😊'
 };
 
+// Campaña Cyber (5–7 oct 2026): un solo texto y un solo audio por ejecutivo, para ambos proyectos.
+// GHL pone el tag de segmento (workflows "Cyber Oct26 - Volkania/Tricalén") y manda campaign = "cyber".
+const CYBER_SEGMENT_TAGS = {
+  contado: 'cyber-contado',
+  financiamiento: 'cyber-financiamiento',
+  sin_urgencia: 'cyber-sin-urgencia'
+};
+const CYBER_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribe {ejecutivo}, del equipo de Maihue. Recibí tu registro en el Cyber de {proyecto} 🙂 Te acabo de dejar un audio con los detalles. ¿Qué día te acomoda visitar el proyecto? {emoji}';
+const CYBER_AUDIO_FILE = 'cyber';
+const PROJECT_DISPLAY_NAMES = {
+  volkania: 'Volkania',
+  tricalen: 'Tricalén'
+};
+
 // Latencias (~30 s al texto, 50–60 s al audio), con variación aleatoria para que
 // los envíos no tengan un ritmo de máquina. Cada rango es [mínimo, máximo] en milisegundos.
 const TEXT_DELAY_RANGE = [25000, 40000];   // webhook → texto al lead
@@ -113,13 +133,54 @@ const SEGMENT_LABELS = {
   sin_urgencia: '😊 Sin urgencia'
 };
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'ZgMWAqw0bvt3n7ZSg9mf';
+// Token de GHL (Private Integration) para escribir el ejecutivo asignado en el contacto y la oportunidad
+const GHL_PIT = process.env.GHL_PIT || null;
+const GHL_API_URL = 'https://services.leadconnectorhq.com';
+
+// Horario de trabajo (hora de Chile), permanente hasta nuevo aviso.
+// Formato de WORK_SCHEDULE: "carolina=15:00-20:00;josefina=09:00-14:00". Quien no aparece no tiene turno.
+// Fuera de todas las ventanas, o si quien está de turno no tiene su WhatsApp conectado, atiende Gerardo.
+const SCHEDULE_TIMEZONE = 'America/Santiago';
+const SCHEDULE_DEFAULT_EXECUTIVE = 'gerardo';
+const WORK_SCHEDULE = parseSchedule(process.env.WORK_SCHEDULE ?? 'carolina=15:00-20:00');
+
+function parseSchedule(text) {
+  const toMinutes = hhmm => {
+    const [h, m] = hhmm.split(':').map(Number);
+    return h * 60 + m;
+  };
+  return String(text).split(';').map(s => s.trim()).filter(Boolean).flatMap(entry => {
+    const match = entry.match(/^(\w+)\s*=\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
+    if (!match) {
+      console.warn(`⚠️  Entrada de horario ignorada: "${entry}"`);
+      return [];
+    }
+    return [{ executive: match[1].toLowerCase(), start: toMinutes(match[2]), end: toMinutes(match[3]) }];
+  });
+}
+
+/**
+ * Minutos desde la medianoche en hora de Chile
+ */
+function chileMinutes(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: SCHEDULE_TIMEZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(date);
+  const get = type => Number(parts.find(p => p.type === type).value);
+  return get('hour') * 60 + get('minute');
+}
+
+function executivesOnShift(date = new Date()) {
+  const now = chileMinutes(date);
+  return WORK_SCHEDULE.filter(w => now >= w.start && now < w.end).map(w => w.executive);
+}
 
 // Mapeo: ID de usuario "Assigned To" en GHL -> clave interna del ejecutivo
 // Ve a Settings → My Staff → click en el usuario → revisa la URL para obtener el ID
 const OWNER_ID_MAP = {
   'xfGUbyF37C0bBtsNGHgb': 'gerardo',
-  // 'ID_DE_JOSEFINA_AQUI': 'josefina',
-  // 'ID_DE_CAROLINA_AQUI': 'carolina',
+  'vGsKBT2O5dDRwH8OZOtj': 'josefina',
+  'o38VaOWN6Cjzdsmd66JH': 'carolina'
 };
 
 /**
@@ -133,10 +194,10 @@ function mapOwnerToExecutive(assignedToId) {
  * Traduce los tags del contacto (GHL los manda como "tag1, tag2" o como arreglo) a un macro-segmento.
  * Devuelve { segment, matched }: matched = false cuando se usó el segmento por defecto.
  */
-function getSegment(tags) {
+function getSegment(tags, segmentTags = SEGMENT_TAGS) {
   const tagList = !tags ? [] : (Array.isArray(tags) ? tags : String(tags).split(','))
     .map(t => String(t).trim().toLowerCase());
-  const segment = SEGMENTS.find(s => tagList.includes(SEGMENT_TAGS[s]));
+  const segment = SEGMENTS.find(s => tagList.includes(segmentTags[s]));
   if (segment) return { segment, matched: true };
   console.warn(`⚠️  Ningún tag de segmento en [${tagList.join(', ')}], uso "${DEFAULT_SEGMENT}"`);
   return { segment: DEFAULT_SEGMENT, matched: false };
@@ -145,10 +206,19 @@ function getSegment(tags) {
 /**
  * Arma la notificación interna para el ejecutivo (normal o con advertencia de segmento faltante)
  */
-function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId }) {
+function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId, sent = true }) {
   const link = contactId
     ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`
     : '(sin ID de contacto)';
+  if (!sent) {
+    return [
+      `⚠️ Nuevo lead — ${projectDisplay} ${SEGMENT_LABELS[segment].split(' ')[0]}`,
+      `👤 ${contactName} | 📱 +${phoneNumber}`,
+      `🏷️ ${SEGMENT_LABELS[segment]}`,
+      `📵 NO se le envió WhatsApp automático: tu número no está conectado. Escríbele a mano.`,
+      `🔗 ${link}`
+    ].join('\n');
+  }
   if (!matched) {
     return [
       `⚠️ Nuevo lead SIN SEGMENTO — ${projectDisplay} 🙌`,
@@ -246,27 +316,90 @@ function identifyProject(formUrl) {
 }
 
 /**
- * Round Robin para Volkania (Gerardo ↔ Josefina)
+ * Elige al ejecutivo según el horario de trabajo. Si hay más de una persona de turno con su
+ * WhatsApp conectado, se alternan (el último asignado queda en Redis).
  */
-async function getRoundRobinExecutive() {
+const SCHEDULE_ROTATION_KEY = 'schedule:round_robin:last';
+let lastScheduledInMemory = null; // respaldo si Redis no responde
+
+async function assignBySchedule(date = new Date()) {
+  const onShift = executivesOnShift(date);
+  const available = [];
+  for (const executive of onShift) {
+    if (await isInstanceOpen(getExecutiveInstance(executive))) available.push(executive);
+  }
+  if (available.length === 0) {
+    if (onShift.length) console.warn(`⚠️  De turno: ${onShift.join(', ')}, pero sin WhatsApp conectado → ${SCHEDULE_DEFAULT_EXECUTIVE}`);
+    return SCHEDULE_DEFAULT_EXECUTIVE;
+  }
+  if (available.length === 1) return available[0];
+
+  let last = lastScheduledInMemory;
+  try { last = (await withTimeout(redisClient.get(SCHEDULE_ROTATION_KEY))) || last; } catch (err) { /* usamos la memoria */ }
+  const next = available[(available.indexOf(last) + 1) % available.length];
+  lastScheduledInMemory = next;
+  withTimeout(redisClient.set(SCHEDULE_ROTATION_KEY, next)).catch(() => { /* usamos la memoria */ });
+  return next;
+}
+
+// Si Redis está caído, el cliente deja los comandos en cola indefinidamente; no esperamos más de 2 s.
+function withTimeout(promise, ms = 2000) {
+  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+}
+
+/**
+ * Segmento Cyber a partir de las respuestas del formulario. null si no llegó ninguna respuesta.
+ */
+function cyberSegmentFromAnswers(visita, pago) {
+  if (!visita && !pago) return null;
+  if (/noviembre/i.test(visita || '')) return 'sin_urgencia';
+  if (/contado/i.test(pago || '')) return 'contado';
+  return 'financiamiento';
+}
+
+function ghlHeaders() {
+  return { Authorization: `Bearer ${GHL_PIT}`, Version: '2021-07-28', 'Content-Type': 'application/json' };
+}
+
+/**
+ * Agrega un tag al contacto en GHL (nunca bloquea el flujo del lead)
+ */
+async function addTagInGhl(contactId, tag) {
+  if (!GHL_PIT || !contactId) {
+    console.warn(`⚠️  No se agregó el tag ${tag} en GHL (GHL_PIT: ${GHL_PIT ? 'ok' : 'falta'}, contactId: ${contactId ? 'ok' : 'falta'})`);
+    return;
+  }
   try {
-    const key = 'volkania:round_robin:last';
-    let lastExecutive = await redisClient.get(key);
-    
-    // Si no existe, empezamos con gerardo
-    if (!lastExecutive) {
-      await redisClient.set(key, 'gerardo');
-      return 'gerardo';
-    }
-    
-    // Alternamos
-    const nextExecutive = lastExecutive === 'gerardo' ? 'josefina' : 'gerardo';
-    await redisClient.set(key, nextExecutive);
-    
-    return nextExecutive;
+    await axios.post(`${GHL_API_URL}/contacts/${contactId}/tags`, { tags: [tag] }, { headers: ghlHeaders(), timeout: 10000 });
+    console.log(`🏷️  GHL: tag ${tag} agregado al contacto`);
   } catch (err) {
-    console.error('Error en Round Robin:', err);
-    return 'gerardo'; // Default fallback
+    console.error(`❌ No se pudo agregar el tag ${tag} en GHL:`, err.response?.status || err.message);
+  }
+}
+
+/**
+ * Escribe en GHL el ejecutivo que eligió el servidor, en el contacto y en la oportunidad.
+ * Al cambiar el asignado de la oportunidad, el workflow "Cyber - Aviso al asignado" notifica a esa persona.
+ */
+async function assignOwnerInGhl({ contactId, opportunityId, executiveName }) {
+  const userId = Object.keys(OWNER_ID_MAP).find(id => OWNER_ID_MAP[id] === executiveName);
+  if (!GHL_PIT || !userId) {
+    console.warn(`⚠️  No se escribió el asignado en GHL (GHL_PIT: ${GHL_PIT ? 'ok' : 'falta'}, usuario de ${executiveName}: ${userId ? 'ok' : 'falta'})`);
+    return;
+  }
+  const headers = ghlHeaders();
+  const targets = [
+    contactId && { kind: 'contacto', url: `${GHL_API_URL}/contacts/${contactId}` },
+    opportunityId && { kind: 'oportunidad', url: `${GHL_API_URL}/opportunities/${opportunityId}` }
+  ].filter(Boolean);
+  if (!targets.length) console.warn('⚠️  Sin contactId ni opportunityId: no se pudo escribir el asignado en GHL');
+  for (const { kind, url } of targets) {
+    try {
+      await axios.put(url, { assignedTo: userId }, { headers, timeout: 10000 });
+      console.log(`👤 GHL: ${kind} asignado a ${executiveName}`);
+    } catch (err) {
+      console.error(`❌ No se pudo asignar el ${kind} en GHL:`, err.response?.status || err.message);
+    }
   }
 }
 
@@ -275,6 +408,34 @@ async function getRoundRobinExecutive() {
  */
 function getExecutiveInstance(executiveName) {
   return EXECUTIVE_INSTANCES[executiveName] || EXECUTIVE_INSTANCES.gerardo;
+}
+
+/**
+ * Consulta a Evolution si la instancia está conectada a WhatsApp (state "open")
+ */
+async function isInstanceOpen(instanceId) {
+  try {
+    const response = await axios.get(
+      `${EVOLUTION_API_URL}/instance/connectionState/${encodeURIComponent(instanceId)}`,
+      { headers: { 'apikey': EVOLUTION_API_KEY }, timeout: 10000 }
+    );
+    const state = response.data?.instance?.state;
+    if (state !== 'open') console.warn(`⚠️  Instancia ${instanceId} no conectada (estado: ${state || 'desconocido'})`);
+    return state === 'open';
+  } catch (err) {
+    console.error(`❌ No se pudo consultar el estado de la instancia ${instanceId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Audio Cyber del ejecutivo. Sin respaldo con la voz de otro: si falta, se envía solo el texto.
+ */
+function getCyberAudioPath(executiveName) {
+  const audioPath = `${AUDIO_BASE_PATH}/${executiveName}/ogg/${CYBER_AUDIO_FILE}.ogg`;
+  if (fs.existsSync(audioPath)) return audioPath;
+  console.warn(`⚠️  No hay audio Cyber para ${executiveName} (${audioPath}); se enviará solo el texto`);
+  return null;
 }
 
 /**
@@ -358,6 +519,10 @@ async function sendMessageAndAudio(phoneNumber, leadName, message, audioPath, de
     const formattedMessage = message.replace('{nombre}', leadName);
     await sendTextMessage(phoneNumber, formattedMessage, instanceId);
 
+    if (!audioPath) {
+      return { success: true, message: 'Texto enviado (sin audio)', phoneNumber, leadName };
+    }
+
     // Esperar antes del audio
     console.log(`⏱️  Esperando ${delay / 1000} segundos antes de enviar audio (${path.basename(audioPath)})...`);
     await sleep(delay);
@@ -412,8 +577,14 @@ app.post('/webhook/ghl', async (req, res) => {
       formUrl,
       project,
       budgetAnswer,
-      assignedTo
+      assignedTo,
+      campaign,
+      visita,
+      pago,
+      pie
     } = payload;
+    const pieAnswer = budgetAnswer || pie;
+    const isCyber = String(campaign || '').trim().toLowerCase() === 'cyber';
     // GHL manda los tags del contacto en la raíz del body, no dentro de customData
     const tags = req.body.tags ?? payload.tags;
     
@@ -436,18 +607,17 @@ app.post('/webhook/ghl', async (req, res) => {
     
     console.log(`🎯 Proyecto identificado: ${projectName}`);
     
-    // Asignar ejecutivo: primero confiamos en el Owner que GHL ya asignó
+    // Asignar ejecutivo: si GHL ya trae un owner reconocible (asignación manual o prueba), se respeta;
+    // si no, decide el horario de trabajo y el servidor lo escribe de vuelta en GHL.
     let executiveName = mapOwnerToExecutive(assignedTo);
-    
+    const ghlContactId = req.body.contact_id || contactId;
+
     if (executiveName) {
       console.log(`👤 Ejecutivo tomado del Owner asignado en GHL: ${executiveName}`);
-    } else if (projectName === 'volkania') {
-      // Respaldo: si no llegó ningún owner reconocible, usamos Round Robin interno
-      executiveName = await getRoundRobinExecutive();
-      console.log(`🔄 Sin owner reconocible, Round Robin interno asignó a: ${executiveName}`);
-    } else if (projectName === 'tricalen') {
-      executiveName = 'carolina';
-      console.log(`📌 Asignado a: Carolina (Tricalén)`);
+    } else {
+      executiveName = await assignBySchedule();
+      console.log(`🕒 Asignado por horario: ${executiveName}`);
+      assignOwnerInGhl({ contactId: ghlContactId, opportunityId, executiveName });
     }
     
     // El destinatario del mensaje es el LEAD, no el ejecutivo
@@ -460,44 +630,73 @@ app.post('/webhook/ghl', async (req, res) => {
     // La instancia de WhatsApp desde la que se envía es la del ejecutivo asignado
     const instanceId = getExecutiveInstance(executiveName);
     
-    // Determinar segmento según el tag que GHL puso al contacto
-    // Solo aplica para Volkania por ahora; Tricalén usa el segmento por defecto y un texto genérico
-    const { segment, matched } = projectName === 'volkania'
-      ? getSegment(tags)
-      : { segment: DEFAULT_SEGMENT, matched: true };
-    const audioPath = getAudioPath(executiveName, segment);
-    console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${budgetAnswer || 'N/A'}") → audio ${audioPath}`);
+    const projectKey = String(projectName).trim().toLowerCase();
+    const projectBase = PROJECT_DISPLAY_NAMES[projectKey] || (projectName.charAt(0).toUpperCase() + projectName.slice(1));
+    const projectDisplay = isCyber ? `Cyber ${projectBase}` : projectBase;
 
-    // Formatear mensaje según segmento
-    const projectDisplay = projectName.charAt(0).toUpperCase() + projectName.slice(1);
-    const message = projectName === 'volkania'
-      ? SEGMENT_MESSAGES[segment]
-      : `Hola {nombre}, gracias por tu interés en ${projectDisplay}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
+    let segment, matched, audioPath, message;
+    if (isCyber) {
+      // Cyber: el segmento sale de las respuestas del formulario (visita/pago) y el servidor
+      // pone el tag en GHL; si no llegan, se usan los tags cyber-* que traiga el contacto.
+      const fromAnswers = cyberSegmentFromAnswers(visita, pago);
+      if (fromAnswers) {
+        segment = fromAnswers;
+        matched = true;
+        addTagInGhl(ghlContactId, CYBER_SEGMENT_TAGS[segment]);
+      } else {
+        ({ segment, matched } = getSegment(tags, CYBER_SEGMENT_TAGS));
+      }
+      audioPath = getCyberAudioPath(executiveName);
+      message = CYBER_MESSAGE
+        .replace('{ejecutivo}', EXECUTIVE_DISPLAY_NAMES[executiveName])
+        .replace('{proyecto}', projectBase)
+        .replace('{emoji}', SEGMENT_LABELS[segment].split(' ')[0]);
+    } else {
+      // Determinar segmento según el tag que GHL puso al contacto
+      // Solo aplica para Volkania por ahora; Tricalén usa el segmento por defecto y un texto genérico
+      ({ segment, matched } = projectKey === 'volkania'
+        ? getSegment(tags)
+        : { segment: DEFAULT_SEGMENT, matched: true });
+      audioPath = getAudioPath(executiveName, segment);
+      message = projectKey === 'volkania'
+        ? SEGMENT_MESSAGES[segment]
+        : `Hola {nombre}, gracias por tu interés en ${projectBase}. Te enviaremos más información en breve. ¿Tienes alguna pregunta?`;
+    }
+    console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${pieAnswer || 'N/A'}") → audio ${audioPath || 'ninguno'}`);
 
-    // Enviar mensaje + audio (async, no esperar respuesta)
-    sendMessageAndAudio(
-      phoneNumber,
-      contactName,
-      message,
-      audioPath,
-      randomBetween(AUDIO_DELAY_RANGE),
-      instanceId,
-      randomBetween(TEXT_DELAY_RANGE)
-    ).catch(err => {
-      console.error('Error en envío de mensaje/audio:', err.message);
-    });
+    // Envío en segundo plano: primero se confirma que el WhatsApp del ejecutivo esté conectado.
+    // Si no lo está, no se envía nada desde otro número; solo se avisa al ejecutivo.
+    (async () => {
+      const sent = await isInstanceOpen(instanceId);
+      if (sent) {
+        sendMessageAndAudio(
+          phoneNumber,
+          contactName,
+          message,
+          audioPath,
+          randomBetween(AUDIO_DELAY_RANGE),
+          instanceId,
+          randomBetween(TEXT_DELAY_RANGE)
+        ).catch(err => {
+          console.error('Error en envío de mensaje/audio:', err.message);
+        });
+      } else {
+        console.warn(`📵 No se envía WhatsApp a ${contactName}: la instancia de ${executiveName} (${instanceId}) no está conectada`);
+      }
 
-    // Aviso interno al ejecutivo desde la Maestra (en paralelo, no espera al lead)
-    notifyExecutive(executiveName, buildExecutiveNotification({
-      projectDisplay,
-      segment,
-      matched,
-      contactName,
-      phoneNumber,
-      tags,
-      budgetAnswer,
-      contactId: req.body.contact_id || contactId
-    }));
+      // Aviso interno al ejecutivo desde la Maestra (en paralelo, no espera al lead)
+      notifyExecutive(executiveName, buildExecutiveNotification({
+        projectDisplay,
+        segment,
+        matched,
+        contactName,
+        phoneNumber,
+        tags,
+        budgetAnswer: pieAnswer,
+        contactId: ghlContactId,
+        sent
+      }));
+    })();
     
     // Responder inmediatamente a GHL
     res.json({
@@ -507,6 +706,7 @@ app.post('/webhook/ghl', async (req, res) => {
         contactName,
         projectName,
         segment,
+        campaign: isCyber ? 'cyber' : 'regular',
         assignedExecutive: executiveName,
         opportunityId
       }
@@ -582,13 +782,18 @@ app.post('/test/send-audio', async (req, res) => {
 });
 
 /**
- * Ver estado de Round Robin
+ * Ver a quién se asignaría un lead ahora (o en ?at=2026-10-05T15:30:00-03:00), sin asignar ni enviar nada
  */
-app.get('/debug/round-robin', async (req, res) => {
+app.get('/debug/schedule', async (req, res) => {
   try {
-    const lastExecutive = await redisClient.get('volkania:round_robin:last');
+    const date = req.query.at ? new Date(req.query.at) : new Date();
+    if (isNaN(date)) return res.status(400).json({ error: 'Fecha inválida en ?at=' });
+    const minutes = chileMinutes(date);
     res.json({
-      lastExecutive: lastExecutive || 'ninguno (será gerardo próxima vez)'
+      chileTime: `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`,
+      schedule: WORK_SCHEDULE,
+      onShift: executivesOnShift(date),
+      wouldAssign: await assignBySchedule(date)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -613,5 +818,5 @@ app.listen(PORT, () => {
   console.log('  POST /webhook/ghl');
   console.log('  POST /test/send-message');
   console.log('  POST /test/send-audio');
-  console.log('  GET  /debug/round-robin');
+  console.log('  GET  /debug/schedule');
 });
