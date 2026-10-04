@@ -350,9 +350,12 @@ function withTimeout(promise, ms = 2000) {
 /**
  * Segmento Cyber a partir de las respuestas del formulario. null si no llegó ninguna respuesta.
  */
+// Respuestas de visita que significan "después de octubre" (el formulario dice, p. ej., "Al siguiente mes")
+const CYBER_LATE_VISIT = /siguiente mes|pr[oó]ximo mes|noviembre|despu[eé]s|m[aá]s adelante/i;
+
 function cyberSegmentFromAnswers(visita, pago) {
   if (!visita && !pago) return null;
-  if (/noviembre/i.test(visita || '')) return 'sin_urgencia';
+  if (CYBER_LATE_VISIT.test(visita || '')) return 'sin_urgencia';
   if (/contado/i.test(pago || '')) return 'contado';
   return 'financiamiento';
 }
@@ -374,6 +377,20 @@ async function addTagInGhl(contactId, tag) {
     console.log(`🏷️  GHL: tag ${tag} agregado al contacto`);
   } catch (err) {
     console.error(`❌ No se pudo agregar el tag ${tag} en GHL:`, err.response?.status || err.message);
+  }
+}
+
+/**
+ * Deja un solo tag de segmento Cyber en el contacto: agrega el actual y quita los otros dos
+ */
+async function setCyberSegmentTag(contactId, segment) {
+  await addTagInGhl(contactId, CYBER_SEGMENT_TAGS[segment]);
+  const others = Object.entries(CYBER_SEGMENT_TAGS).filter(([s]) => s !== segment).map(([, tag]) => tag);
+  if (!GHL_PIT || !contactId) return;
+  try {
+    await axios.delete(`${GHL_API_URL}/contacts/${contactId}/tags`, { headers: ghlHeaders(), data: { tags: others }, timeout: 10000 });
+  } catch (err) {
+    console.error('❌ No se pudieron quitar los otros tags de segmento en GHL:', err.response?.status || err.message);
   }
 }
 
@@ -571,7 +588,7 @@ app.post('/webhook/ghl', async (req, res) => {
     // Extraer datos del webhook
     const {
       contactId,
-      contactName,
+      contactName: rawContactName,
       contactPhone,
       opportunityId,
       formUrl,
@@ -584,6 +601,8 @@ app.post('/webhook/ghl', async (req, res) => {
       pie
     } = payload;
     const pieAnswer = budgetAnswer || pie;
+    // GHL puede mandar el nombre con tabulaciones o espacios de más (p. ej. "	Gerardo")
+    const contactName = String(rawContactName || '').trim();
     const isCyber = String(campaign || '').trim().toLowerCase() === 'cyber';
     // GHL manda los tags del contacto en la raíz del body, no dentro de customData
     const tags = req.body.tags ?? payload.tags;
@@ -642,7 +661,7 @@ app.post('/webhook/ghl', async (req, res) => {
       if (fromAnswers) {
         segment = fromAnswers;
         matched = true;
-        addTagInGhl(ghlContactId, CYBER_SEGMENT_TAGS[segment]);
+        setCyberSegmentTag(ghlContactId, segment);
       } else {
         ({ segment, matched } = getSegment(tags, CYBER_SEGMENT_TAGS));
       }
