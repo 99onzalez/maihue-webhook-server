@@ -215,10 +215,7 @@ function getSegment(tags, segmentTags = SEGMENT_TAGS) {
 /**
  * Arma la notificación interna para el ejecutivo (normal o con advertencia de segmento faltante)
  */
-function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, contactId, sent = true, answers = {} }) {
-  const link = contactId
-    ? `https://app.gohighlevel.com/v2/location/${GHL_LOCATION_ID}/contacts/detail/${contactId}`
-    : '(sin ID de contacto)';
+function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, sent = true, answers = {} }) {
   // Respuestas del formulario que llegaron en el webhook
   const answerLine = [
     answers.visita && `visita: ${answers.visita}`,
@@ -231,8 +228,7 @@ function buildExecutiveNotification({ projectDisplay, segment, matched, contactN
       `👤 ${contactName} | 📱 +${phoneNumber}`,
       `🏷️ ${SEGMENT_LABELS[segment]}`,
       answerLine && `📝 ${answerLine}`,
-      `📵 NO se le envió WhatsApp automático: nadie estaba disponible (WhatsApp desconectado o marcado ausente). Escríbele a mano.`,
-      `🔗 ${link}`
+      `📵 NO se le envió WhatsApp automático: nadie estaba disponible (WhatsApp desconectado o marcado ausente). Escríbele a mano.`
     ].filter(Boolean).join('\n');
   }
   if (!matched) {
@@ -241,8 +237,7 @@ function buildExecutiveNotification({ projectDisplay, segment, matched, contactN
       `👤 ${contactName} | 📱 +${phoneNumber}`,
       `🏷️ Tags recibidos: ${tags || 'ninguno'} (ninguno de segmento)`,
       `📨 Se le envió el mensaje y audio de Financiamiento (por defecto)`,
-      `👉 Revisa sus respuestas en GHL y corrige el tag antes de llamar`,
-      `🔗 ${link}`
+      `👉 Revisa sus respuestas en GHL y corrige el tag antes de llamar`
     ].join('\n');
   }
   const emoji = SEGMENT_LABELS[segment].split(' ')[0];
@@ -250,15 +245,14 @@ function buildExecutiveNotification({ projectDisplay, segment, matched, contactN
     `🔔 Nuevo lead — ${projectDisplay} ${emoji}`,
     `👤 ${contactName} | 📱 +${phoneNumber}`,
     `🏷️ ${SEGMENT_LABELS[segment]}`,
-    answerLine && `📝 ${answerLine}`,
-    `🔗 ${link}`
+    answerLine && `📝 ${answerLine}`
   ].filter(Boolean).join('\n');
 }
 
 /**
  * Envía la notificación al ejecutivo desde la instancia Maestra (nunca bloquea el flujo del lead)
  */
-async function notifyExecutive(executiveName, text) {
+async function notifyExecutive(executiveName, text, contactCard = null) {
   const executivePhone = formatPhoneNumber(EXECUTIVE_PHONES[executiveName]);
   if (!MAESTRA_INSTANCE || !executivePhone) {
     console.warn(`⚠️  Aviso al ejecutivo omitido (INSTANCE_MAESTRA: ${MAESTRA_INSTANCE ? 'ok' : 'falta'}, teléfono de ${executiveName}: ${executivePhone ? 'ok' : 'falta'})`);
@@ -268,6 +262,7 @@ async function notifyExecutive(executiveName, text) {
     await sleep(randomBetween(NOTIFY_DELAY_RANGE));
     await sendTextMessage(executivePhone, text, MAESTRA_INSTANCE);
     console.log(`🔔 Aviso enviado a ${executiveName} desde la Maestra`);
+    if (contactCard) await sendContactCard(executivePhone, contactCard, MAESTRA_INSTANCE);
   } catch (err) {
     console.error(`❌ No se pudo avisar a ${executiveName}:`, err.message);
   }
@@ -560,6 +555,22 @@ async function sendTextMessage(phoneNumber, message, instanceId = INSTANCE_ID) {
 }
 
 /**
+ * Envía una tarjeta de contacto (vCard) para guardar al lead con "Guardar contacto"
+ */
+async function sendContactCard(phoneNumber, { fullName, contactPhone }, instanceId) {
+  const response = await axios.post(
+    `${EVOLUTION_API_URL}/message/sendContact/${instanceId}`,
+    {
+      number: phoneNumber,
+      contact: [{ fullName, wuid: contactPhone, phoneNumber: `+${contactPhone}` }]
+    },
+    { headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY } }
+  );
+  console.log(`📇 Tarjeta de contacto enviada a ${phoneNumber} (desde instancia ${instanceId})`);
+  return response.data;
+}
+
+/**
  * Envía audio vía Evolution API
  */
 async function sendAudioMessage(phoneNumber, audioPath, instanceId = INSTANCE_ID) {
@@ -792,12 +803,13 @@ app.post('/webhook/ghl', async (req, res) => {
         phoneNumber,
         tags,
         budgetAnswer: pieAnswer,
-        contactId: ghlContactId,
         sent,
         answers: { visita, pago }
       });
       const recipients = sent ? [executiveName] : [SCHEDULE_DEFAULT_EXECUTIVE, CENTRAL_EXECUTIVE];
-      recipients.forEach(r => notifyExecutive(r, notification));
+      // Tarjeta para guardar al lead en el teléfono, con el proyecto en el nombre
+      const contactCard = { fullName: `${contactName} · ${projectDisplay}`, contactPhone: phoneNumber };
+      recipients.forEach(r => notifyExecutive(r, notification, contactCard));
     })();
     
     // Responder inmediatamente a GHL
