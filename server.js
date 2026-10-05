@@ -101,7 +101,7 @@ const CYBER_SEGMENT_TAGS = {
   financiamiento: 'cyber-financiamiento',
   sin_urgencia: 'cyber-sin-urgencia'
 };
-const CYBER_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribe {ejecutivo}, del equipo de Maihue. Recibí tu registro en el Cyber de {proyecto} 🙂 Te acabo de dejar un audio con los detalles. ¿Qué día te acomoda visitar el proyecto? {emoji}';
+const CYBER_MESSAGE = 'Hola {nombre}, ¿Cómo estás? Te escribe {ejecutivo}, del equipo de Maihue. Recibí tu registro en el Cyber de {proyecto} {emoji}';
 const CYBER_AUDIO_FILE = 'cyber';
 // Desde Central sale solo texto (sin audio), firmado por el equipo de Maihue
 const CENTRAL_CYBER_MESSAGE = 'Hola {nombre}, ¿cómo estás? Te escribimos del equipo de Maihue. Recibimos tu registro en el Cyber de {proyecto} 🙂 Te recordamos las condiciones: $1.000.000 de descuento en cualquier parcela, con cualquier medio de pago y acumulable con el precio al contado. Son solo 3 cupos en total entre Volkania y Tricalén, y para hacerlo válido debes agendar tu visita y comprar durante octubre (hasta el 31 de octubre). ¿Qué día te acomoda visitar el proyecto? {emoji}';
@@ -110,6 +110,15 @@ const PROJECT_DISPLAY_NAMES = {
   volkania: 'Volkania',
   tricalen: 'Tricalén'
 };
+const PROJECT_EMOJIS = {
+  volkania: '🌋',
+  tricalen: '🌲'
+};
+// Respuesta de pie del formulario → texto corto para el aviso de la Maestra
+const PIE_SHORT = [
+  [/entre.*4.*6/i, '4-6M'],
+  [/m[aá]s de.*6/i, '+6M']
+];
 
 // Latencias (~30 s al texto, 50–60 s al audio), con variación aleatoria para que
 // los envíos no tengan un ritmo de máquina. Cada rango es [mínimo, máximo] en milisegundos.
@@ -215,38 +224,46 @@ function getSegment(tags, segmentTags = SEGMENT_TAGS) {
 /**
  * Arma la notificación interna para el ejecutivo (normal o con advertencia de segmento faltante)
  */
-function buildExecutiveNotification({ projectDisplay, segment, matched, contactName, phoneNumber, tags, budgetAnswer, sent = true, answers = {} }) {
-  // Respuestas del formulario que llegaron en el webhook
-  const answerLine = [
-    answers.visita && `visita: ${answers.visita}`,
-    answers.pago && `pago: ${answers.pago}`,
-    budgetAnswer && `pie: ${budgetAnswer}`
-  ].filter(Boolean).join(' · ');
+// "56912345678" → "+56 9 1234 5678" (solo para lectura rápida)
+function formatPhoneForReading(phoneNumber) {
+  const m = String(phoneNumber).match(/^56(9)(\d{4})(\d{4})$/);
+  return m ? `+56 ${m[1]} ${m[2]} ${m[3]}` : `+${phoneNumber}`;
+}
+
+function shortPie(pie) {
+  if (!pie) return null;
+  const hit = PIE_SHORT.find(([re]) => re.test(pie));
+  return hit ? hit[1] : pie;
+}
+
+function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, matched, contactName, phoneNumber, tags, budgetAnswer, sent = true, answers = {} }) {
+  const [segmentEmoji, ...labelWords] = SEGMENT_LABELS[segment].split(' ');
+  const header = projectEmoji ? `${projectDisplay} ${projectEmoji}` : projectDisplay;
+  const phone = formatPhoneForReading(phoneNumber);
+  const pie = shortPie(budgetAnswer);
+  const details = [
+    `👤 ${contactName} | 📱 ${phone}`,
+    `🏷️ ${labelWords.join(' ')} ${segmentEmoji}`,
+    pie && `💰 capacidad de pago: ${pie}`,
+    answers.visita && `📅 visita: ${answers.visita}`
+  ];
   if (!sent) {
     return [
-      `⚠️ Lead SIN CONTACTAR — ${projectDisplay} ${SEGMENT_LABELS[segment].split(' ')[0]}`,
-      `👤 ${contactName} | 📱 +${phoneNumber}`,
-      `🏷️ ${SEGMENT_LABELS[segment]}`,
-      answerLine && `📝 ${answerLine}`,
+      `⚠️ Lead SIN CONTACTAR — ${header}`,
+      ...details,
       `📵 NO se le envió WhatsApp automático: nadie estaba disponible (WhatsApp desconectado o marcado ausente). Escríbele a mano.`
     ].filter(Boolean).join('\n');
   }
   if (!matched) {
     return [
-      `⚠️ Nuevo lead SIN SEGMENTO — ${projectDisplay} 🙌`,
-      `👤 ${contactName} | 📱 +${phoneNumber}`,
+      `⚠️ Nuevo lead SIN SEGMENTO — ${header}`,
+      `👤 ${contactName} | 📱 ${phone}`,
       `🏷️ Tags recibidos: ${tags || 'ninguno'} (ninguno de segmento)`,
       `📨 Se le envió el mensaje y audio de Financiamiento (por defecto)`,
       `👉 Revisa sus respuestas en GHL y corrige el tag antes de llamar`
     ].join('\n');
   }
-  const emoji = SEGMENT_LABELS[segment].split(' ')[0];
-  return [
-    `🔔 Nuevo lead — ${projectDisplay} ${emoji}`,
-    `👤 ${contactName} | 📱 +${phoneNumber}`,
-    `🏷️ ${SEGMENT_LABELS[segment]}`,
-    answerLine && `📝 ${answerLine}`
-  ].filter(Boolean).join('\n');
+  return [`🔔 Nuevo lead — ${header}`, ...details].filter(Boolean).join('\n');
 }
 
 /**
@@ -743,6 +760,9 @@ app.post('/webhook/ghl', async (req, res) => {
     const projectKey = String(projectName).trim().toLowerCase();
     const projectBase = PROJECT_DISPLAY_NAMES[projectKey] || (projectName.charAt(0).toUpperCase() + projectName.slice(1));
     const projectDisplay = isCyber ? `Cyber ${projectBase}` : projectBase;
+    // Nombre de pila con mayúscula inicial (GHL a veces lo guarda en minúsculas)
+    const firstWord = contactName.split(/\s+/)[0];
+    const leadFirstName = firstWord.charAt(0).toUpperCase() + firstWord.slice(1);
 
     let segment, matched, audioPath, message;
     if (isCyber) {
@@ -758,6 +778,7 @@ app.post('/webhook/ghl', async (req, res) => {
       }
       audioPath = isCentral ? null : getCyberAudioPath(executiveName);
       message = (isCentral ? CENTRAL_CYBER_MESSAGE : CYBER_MESSAGE)
+        .replace('{nombre}', leadFirstName)
         .replace('{ejecutivo}', EXECUTIVE_DISPLAY_NAMES[executiveName])
         .replace('{proyecto}', projectBase)
         .replace('{emoji}', SEGMENT_LABELS[segment].split(' ')[0]);
@@ -787,7 +808,11 @@ app.post('/webhook/ghl', async (req, res) => {
           randomBetween(AUDIO_DELAY_RANGE),
           instanceId,
           randomBetween(TEXT_DELAY_RANGE)
-        ).catch(err => {
+        ).then(() => {
+          // Confirmación al ejecutivo cuando el lead ya recibió todo
+          const received = audioPath ? 'el mensaje y el audio' : 'el mensaje';
+          notifyExecutive(executiveName, `⚡ A ${leadFirstName} ya le llegó ${received}, ¡vamos por ese cierre!`);
+        }).catch(err => {
           console.error('Error en envío de mensaje/audio:', err.message);
         });
       } else {
@@ -797,6 +822,7 @@ app.post('/webhook/ghl', async (req, res) => {
       // Aviso interno desde la Maestra (en paralelo, no espera al lead)
       const notification = buildExecutiveNotification({
         projectDisplay,
+        projectEmoji: PROJECT_EMOJIS[projectKey],
         segment,
         matched,
         contactName,
