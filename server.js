@@ -608,6 +608,11 @@ async function appendClientRow(lead) {
     'ID contacto GHL': lead.contactId || '',
     'Estado': 'Nuevo'
   };
+  // Sheets toma como fórmula todo lo que empieza con + = - @ (p. ej. "+6M" → #ERROR!): se fuerza como texto.
+  // Teléfono e ID ya los deja como texto el script de la planilla.
+  for (const [header, value] of Object.entries(fila)) {
+    if (!['Teléfono', 'ID contacto GHL'].includes(header) && /^[+=\-@]/.test(String(value))) fila[header] = `'${value}`;
+  }
   try {
     const { data } = await axios.post(CLIENT_SHEET_URL, { secret: CLIENT_SHEET_SECRET, fila }, { timeout: 30000, maxRedirects: 5 });
     if (data?.ok) console.log(`📗 Planilla de clientes: ${data.duplicate ? 'ya estaba registrado' : 'fila agregada'}`);
