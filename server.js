@@ -230,13 +230,44 @@ function formatPhoneForReading(phoneNumber) {
   return m ? `+56 ${m[1]} ${m[2]} ${m[3]}` : `+${phoneNumber}`;
 }
 
+// "albert cayumán" → "Albert Cayumán" (no toca lo que ya viene con mayúsculas)
+function capitalizeWords(text) {
+  return text.split(/\s+/).filter(Boolean).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i;
+const PHONE_PROBLEM_TAG = 'telefono-invalido';
+const PHONE_PROBLEM_LABELS = {
+  formato: 'El número está incompleto, mal escrito o es de red fija',
+  sin_whatsapp: 'El número no tiene WhatsApp'
+};
+
+/**
+ * Revisa el teléfono del lead: formato (móvil chileno 569 + 8 dígitos, o internacional de 8 a 15 dígitos)
+ * y, si el formato está bien, si el número tiene WhatsApp (Evolution). Devuelve null si está bien,
+ * "formato" o "sin_whatsapp". Si Evolution no responde, se da por bueno para no frenar el lead.
+ */
+async function checkLeadPhone(phoneNumber, instanceId) {
+  if (!phoneNumber || !/^\d{8,15}$/.test(phoneNumber) || (phoneNumber.startsWith('56') && !/^569\d{8}$/.test(phoneNumber))) return 'formato';
+  if (!instanceId) return null;
+  try {
+    const { data } = await axios.post(`${EVOLUTION_API_URL}/chat/whatsappNumbers/${encodeURIComponent(instanceId)}`,
+      { numbers: [phoneNumber] }, { headers: { apikey: EVOLUTION_API_KEY, 'Content-Type': 'application/json' }, timeout: 10000 });
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (entry && entry.exists === false) return 'sin_whatsapp';
+  } catch (err) {
+    console.warn('⚠️  No se pudo verificar si el número tiene WhatsApp (se envía igual):', err.message);
+  }
+  return null;
+}
+
 function shortPie(pie) {
   if (!pie) return null;
   const hit = PIE_SHORT.find(([re]) => re.test(pie));
   return hit ? hit[1] : pie;
 }
 
-function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, matched, contactName, phoneNumber, tags, budgetAnswer, sent = true, answers = {}, derivedNote = null }) {
+function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, matched, contactName, phoneNumber, tags, budgetAnswer, sent = true, answers = {}, derivedNote = null, phoneProblem = null, rawPhone = '', email = '' }) {
   const [segmentEmoji, ...labelWords] = SEGMENT_LABELS[segment].split(' ');
   const header = projectEmoji ? `${projectDisplay} ${projectEmoji}` : projectDisplay;
   const phone = formatPhoneForReading(phoneNumber);
@@ -247,6 +278,17 @@ function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, mat
     pie && `💰 capacidad de pago: ${pie}`,
     answers.visita && `📅 visita: ${answers.visita}`
   ];
+  if (phoneProblem) {
+    const emailLine = !email ? '✉️ No dejó correo'
+      : `✉️ ${email}${EMAIL_PATTERN.test(email) ? '' : ' (el correo también parece mal escrito)'}`;
+    return [
+      `📵 Lead con teléfono inválido — ${header}`,
+      `👤 ${contactName} | 📱 escribió: ${rawPhone || '(nada)'}`,
+      emailLine,
+      ...details.slice(1),
+      `⚠️ ${PHONE_PROBLEM_LABELS[phoneProblem]}: no se le envió WhatsApp. Escríbele al correo o búscalo en GHL.`
+    ].filter(Boolean).join('\n');
+  }
   if (!sent) {
     return [
       `⚠️ Lead SIN CONTACTAR — ${header}`,
@@ -344,10 +386,10 @@ users.init({
  */
 function identifyProject(formUrl) {
   if (!formUrl) return null;
-  
+
   if (formUrl.includes('volkania')) return 'volkania';
   if (formUrl.includes('tricalen')) return 'tricalen';
-  
+
   return null;
 }
 
@@ -606,7 +648,10 @@ async function appendClientRow(lead) {
     'Acepta marketing': lead.marketing ? (accepted ? 'Sí' : 'No') : '',
     'Fecha de aceptación': accepted ? today : '',
     'ID contacto GHL': lead.contactId || '',
-    'Estado': 'Nuevo'
+    'Formulario': lead.formulario || '',
+    'Anuncio': lead.anuncio || '',
+    'Estado': 'Nuevo',
+    'Notas': lead.notas || ''
   };
   // Sheets toma como fórmula todo lo que empieza con + = - @ (p. ej. "+6M" → #ERROR!): se fuerza como texto.
   // Teléfono e ID ya los deja como texto el script de la planilla.
@@ -713,7 +758,7 @@ async function sendTextMessage(phoneNumber, message, instanceId = INSTANCE_ID) {
         }
       }
     );
-    
+
     console.log(`✅ Mensaje de texto enviado a ${phoneNumber} (desde instancia ${instanceId})`);
     return response.data;
   } catch (err) {
@@ -758,7 +803,7 @@ async function sendAudioMessage(phoneNumber, base64Audio, instanceId = INSTANCE_
         }
       }
     );
-    
+
     console.log(`✅ Audio enviado a ${phoneNumber} (desde instancia ${instanceId})`);
     console.log('📋 Respuesta de Evolution API:', JSON.stringify(response.data));
     return response.data;
@@ -792,7 +837,7 @@ async function sendMessageAndAudio(phoneNumber, leadName, message, audio, delay 
 
     // Enviar audio
     await sendAudioMessage(phoneNumber, audio.base64, instanceId);
-    
+
     return {
       success: true,
       message: 'Mensaje y audio enviados correctamente',
@@ -827,10 +872,10 @@ app.post('/webhook/ghl', async (req, res) => {
   try {
     console.log('📨 Webhook recibido de GHL');
     console.log('Payload:', JSON.stringify(req.body, null, 2));
-    
+
     // GHL a veces envía los datos anidados dentro de "customData"
     const payload = req.body.customData || req.body;
-    
+
     // Extraer datos del webhook
     const {
       contactId,
@@ -847,31 +892,42 @@ app.post('/webhook/ghl', async (req, res) => {
       pie
     } = payload;
     const pieAnswer = budgetAnswer || pie;
-    // GHL puede mandar el nombre con tabulaciones o espacios de más (p. ej. "	Gerardo")
-    const contactName = String(rawContactName || '').trim();
+    // Nombre completo tal como lo escribió en el formulario (customData.contactName trae solo el nombre de pila,
+    // a veces con tabulaciones de más). GHL a veces lo guarda en minúsculas: se capitaliza cada palabra.
+    const contactName = capitalizeWords(String(req.body.full_name
+      || [req.body.first_name, req.body.last_name].filter(Boolean).join(' ')
+      || rawContactName || '').trim());
+    // Formulario de Meta de origen (para la planilla y para comparar formularios)
+    const formName = req.body.contact?.lastAttributionSource?.formName
+      || req.body.contact?.attributionSource?.formName || payload.formName || '';
+    const adName = req.body.contact?.lastAttributionSource?.adName || req.body.contact?.attributionSource?.adName || '';
+    // El teléfono de la raíz trae el código de país (+56...); el de customData, solo lo que escribió el lead
+    const rawPhone = String(req.body.phone || contactPhone || '').trim();
+    const email = String(req.body.email || payload.contactEmail || payload.email || '').trim();
     const isCyber = String(campaign || '').trim().toLowerCase() === 'cyber';
     // GHL manda los tags del contacto en la raíz del body, no dentro de customData
     const tags = req.body.tags ?? payload.tags;
-    
+
     // Validar datos mínimos
-    if (!contactName || !contactPhone) {
-      console.error('❌ Datos insuficientes. contactName:', contactName, '| contactPhone:', contactPhone);
+    // Sin teléfono el lead igual se procesa: la Maestra avisa para contactarlo por otro medio
+    if (!contactName) {
+      console.error('❌ Datos insuficientes: falta el nombre del lead');
       return res.status(400).json({
-        error: 'Datos insuficientes: se requiere nombre y teléfono'
+        error: 'Datos insuficientes: se requiere el nombre'
       });
     }
-    
+
     // Identificar el proyecto
     const projectName = project || identifyProject(formUrl);
-    
+
     if (!projectName) {
       return res.status(400).json({
         error: 'No se pudo identificar el proyecto'
       });
     }
-    
+
     console.log(`🎯 Proyecto identificado: ${projectName}`);
-    
+
     // Asignar ejecutivo: si GHL ya trae un owner reconocible (asignación manual o prueba), se respeta;
     // si no, decide el horario de trabajo y el servidor lo escribe de vuelta en GHL.
     // Si ese owner no está disponible, se aplica la misma cadena de respaldo.
@@ -894,17 +950,20 @@ app.post('/webhook/ghl', async (req, res) => {
       ownerWritten = assignOwnerInGhl({ contactId: ghlContactId, opportunityId, executiveName });
     }
     const isCentral = executiveName === CENTRAL_EXECUTIVE;
-    
-    // El destinatario del mensaje es el LEAD, no el ejecutivo
-    const phoneNumber = formatPhoneNumber(contactPhone);
-    if (!phoneNumber) {
-      console.error('❌ No se pudo formatear el número del lead:', contactPhone);
-      return res.status(400).json({ error: 'Número de teléfono del lead inválido' });
-    }
-    
+
     // La instancia de WhatsApp desde la que se envía es la del ejecutivo asignado
     const instanceId = getExecutiveInstance(executiveName);
-    
+
+    // El destinatario del mensaje es el LEAD. Si el número está mal escrito o no tiene WhatsApp,
+    // no se le envía nada y la Maestra avisa al ejecutivo para que lo contacte por correo.
+    const phoneNumber = formatPhoneNumber(rawPhone);
+    const phoneProblem = await checkLeadPhone(phoneNumber, sent ? instanceId : MAESTRA_INSTANCE);
+    const contactable = sent && !phoneProblem;
+    if (phoneProblem) {
+      console.warn(`📵 Teléfono del lead con problema (${phoneProblem}): no se envía WhatsApp`);
+      addTagInGhl(ghlContactId, PHONE_PROBLEM_TAG);
+    }
+
     const projectKey = String(projectName).trim().toLowerCase();
     const projectBase = PROJECT_DISPLAY_NAMES[projectKey] || (projectName.charAt(0).toUpperCase() + projectName.slice(1));
     const projectDisplay = isCyber ? `Cyber ${projectBase}` : projectBase;
@@ -937,13 +996,13 @@ app.post('/webhook/ghl', async (req, res) => {
     }
     // Los mensajes (editables en el panel) usan {nombre}, {ejecutivo}, {proyecto} y {emoji}
     message = fillMessage(message, {
-      nombre: isCyber ? leadFirstName : contactName,
+      nombre: leadFirstName,
       ejecutivo: users.displayName(executiveName),
       proyecto: projectBase,
       emoji: SEGMENT_LABELS[segment].split(' ')[0]
     });
     // Central envía solo texto; los demás, su propio audio si lo tienen (nunca la voz de otro)
-    const audio = isCentral || !sent ? null : await getAudio(executiveName, audioSlot);
+    const audio = isCentral || !contactable ? null : await getAudio(executiveName, audioSlot);
     console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${pieAnswer || 'N/A'}") → audio ${audio ? audio.label : 'ninguno'}`);
 
     // Base de clientes: campos fijos en GHL + tag "base-clientes", y la fila en la planilla
@@ -960,15 +1019,18 @@ app.post('/webhook/ghl', async (req, res) => {
       ...clientBase,
       contactId: ghlContactId,
       nombre: contactName,
-      telefono: formatPhoneForReading(phoneNumber),
-      correo: req.body.email || payload.contactEmail || payload.email,
-      responsable: users.displayName(executiveName)
+      telefono: phoneProblem ? rawPhone : formatPhoneForReading(phoneNumber),
+      correo: email,
+      formulario: formName,
+      anuncio: adName,
+      responsable: users.displayName(executiveName),
+      notas: phoneProblem ? `⚠️ Teléfono: ${PHONE_PROBLEM_LABELS[phoneProblem]}` : ''
     });
 
     // Envío en segundo plano. La disponibilidad ya se revisó al asignar; si nadie estaba
     // disponible (sent = false), no se envía nada y la Maestra avisa a Gerardo y a Central.
     (async () => {
-      if (sent) {
+      if (contactable) {
         sendMessageAndAudio(
           phoneNumber,
           contactName,
@@ -985,7 +1047,7 @@ app.post('/webhook/ghl', async (req, res) => {
           console.error('Error en envío de mensaje/audio:', err.message);
         });
       } else {
-        console.warn(`📵 No se envía WhatsApp a ${contactName}: nadie disponible`);
+        console.warn(`📵 No se envía WhatsApp a ${contactName}: ${phoneProblem ? 'teléfono con problema' : 'nadie disponible'}`);
       }
 
       // Aviso interno desde la Maestra (en paralelo, no espera al lead)
@@ -1000,14 +1062,18 @@ app.post('/webhook/ghl', async (req, res) => {
         budgetAnswer: pieAnswer,
         sent,
         answers: { visita, pago },
-        derivedNote: sent ? derivationNotices({ skipped, executiveName, contactName, projectDisplay }) : null
+        phoneProblem,
+        rawPhone,
+        email,
+        derivedNote: contactable ? derivationNotices({ skipped, executiveName, contactName, projectDisplay }) : null
       });
       const recipients = sent ? [executiveName] : [SCHEDULE_DEFAULT_EXECUTIVE, CENTRAL_EXECUTIVE];
-      // Tarjeta para guardar al lead en el teléfono, con el proyecto en el nombre
-      const contactCard = { fullName: `${contactName} · ${projectDisplay}`, contactPhone: phoneNumber };
+      // Tarjeta para guardar al lead en el teléfono, con su nombre completo y el proyecto
+      // (sin tarjeta si el número está malo: guardaría un contacto inservible)
+      const contactCard = phoneProblem ? null : { fullName: `${contactName} · ${projectDisplay}`, contactPhone: phoneNumber };
       recipients.forEach(r => notifyExecutive(r, notification, contactCard));
     })();
-    
+
     // Responder inmediatamente a GHL
     res.json({
       success: true,
@@ -1018,14 +1084,15 @@ app.post('/webhook/ghl', async (req, res) => {
         segment,
         campaign: isCyber ? 'cyber' : 'regular',
         assignedExecutive: executiveName,
-        autoMessage: sent,
+        autoMessage: contactable,
+        phoneProblem,
         opportunityId
       }
     });
-    
+
     // Log
     console.log(`✅ Lead procesado: ${contactName} → ${executiveName} (${projectName}, ${segment})`);
-    
+
   } catch (err) {
     console.error('❌ Error en webhook:', err.message);
     res.status(500).json({
@@ -1041,15 +1108,15 @@ app.post('/webhook/ghl', async (req, res) => {
 app.post('/test/send-message', async (req, res) => {
   try {
     const { phoneNumber, message } = req.body;
-    
+
     if (!phoneNumber || !message) {
       return res.status(400).json({
         error: 'Se requiere phoneNumber y message'
       });
     }
-    
+
     const result = await sendTextMessage(phoneNumber, message);
-    
+
     res.json({
       success: true,
       result
@@ -1261,8 +1328,8 @@ app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════╗
 ║  🚀 Servidor Maihue Webhook                ║
-║  Puerto: ${PORT}                            
-║  Instance ID: ${INSTANCE_ID}  
+║  Puerto: ${PORT}
+║  Instance ID: ${INSTANCE_ID}
 ║  Estado: Online                            ║
 ╚════════════════════════════════════════════╝
   `);
