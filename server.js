@@ -555,7 +555,7 @@ async function syncClientBase(contactId, values, ownerWritten = Promise.resolve(
   }
   try {
     const ids = await getCustomFieldIds();
-    const accepted = /^(s[ií]|yes|true|1|acepto)/i.test(String(values.marketing || '').trim());
+    const accepted = isMarketingAccepted(values.marketing);
     const all = { ...values, fechaMarketing: accepted ? new Date().toLocaleDateString('es-CL', { timeZone: SCHEDULE_TIMEZONE }) : null };
     const missing = [];
     const customFields = Object.entries(CLIENT_BASE_FIELDS).flatMap(([key, name]) => {
@@ -570,6 +570,50 @@ async function syncClientBase(contactId, values, ownerWritten = Promise.resolve(
     console.log(`📒 Base de clientes: ${customFields.length} campos escritos en GHL`);
   } catch (err) {
     console.error('❌ No se pudo escribir la base de clientes en GHL:', err.response?.status || err.message);
+  }
+}
+
+/**
+ * Planilla "Base de Clientes Maihue": el servidor envía cada lead a un Apps Script publicado en la
+ * planilla (gratis, sin la acción premium de GHL). El script ubica cada valor por el nombre del
+ * encabezado, así que agregar o mover columnas solo requiere ajustar estas claves.
+ */
+const CLIENT_SHEET_URL = process.env.CLIENT_SHEET_URL || null;
+const CLIENT_SHEET_SECRET = process.env.CLIENT_SHEET_SECRET || null;
+
+function isMarketingAccepted(answer) {
+  return /^(s[ií]|yes|true|1|acepto)/i.test(String(answer || '').trim());
+}
+
+async function appendClientRow(lead) {
+  if (!CLIENT_SHEET_URL || !CLIENT_SHEET_SECRET) {
+    console.warn('⚠️  Planilla de clientes omitida (faltan CLIENT_SHEET_URL o CLIENT_SHEET_SECRET)');
+    return;
+  }
+  const today = new Date().toLocaleDateString('es-CL', { timeZone: SCHEDULE_TIMEZONE });
+  const accepted = isMarketingAccepted(lead.marketing);
+  const fila = {
+    'Fecha de ingreso': today,
+    'Nombre': lead.nombre,
+    'Teléfono': lead.telefono,
+    'Correo': lead.correo || '',
+    'Proyecto': lead.proyecto,
+    'Campaña': lead.campana,
+    'Segmento': lead.segmento,
+    'Capacidad de pago': lead.capacidad || '',
+    'Visita': lead.visita || '',
+    'Responsable': lead.responsable,
+    'Acepta marketing': lead.marketing ? (accepted ? 'Sí' : 'No') : '',
+    'Fecha de aceptación': accepted ? today : '',
+    'ID contacto GHL': lead.contactId || '',
+    'Estado': 'Nuevo'
+  };
+  try {
+    const { data } = await axios.post(CLIENT_SHEET_URL, { secret: CLIENT_SHEET_SECRET, fila }, { timeout: 30000, maxRedirects: 5 });
+    if (data?.ok) console.log(`📗 Planilla de clientes: ${data.duplicate ? 'ya estaba registrado' : 'fila agregada'}`);
+    else console.error('❌ La planilla de clientes rechazó la fila:', data?.error || 'respuesta inesperada');
+  } catch (err) {
+    console.error('❌ No se pudo escribir en la planilla de clientes:', err.response?.status || err.message);
   }
 }
 
@@ -897,15 +941,24 @@ app.post('/webhook/ghl', async (req, res) => {
     const audio = isCentral || !sent ? null : await getAudio(executiveName, audioSlot);
     console.log(`💰 Segmento: ${segment} (tags: "${tags || 'N/A'}", pie: "${pieAnswer || 'N/A'}") → audio ${audio ? audio.label : 'ninguno'}`);
 
-    // Base de clientes: campos fijos en GHL + tag "base-clientes" (dispara el workflow de la planilla)
-    syncClientBase(ghlContactId, {
+    // Base de clientes: campos fijos en GHL + tag "base-clientes", y la fila en la planilla
+    const clientBase = {
       proyecto: projectBase,
       segmento: SEGMENT_LABELS[segment].split(' ').slice(1).join(' '),
       campana: isCyber ? CYBER_CAMPAIGN_LABEL : (payload.campaignName || 'General'),
       capacidad: shortPie(pieAnswer),
       visita,
       marketing: payload.marketing
-    }, ownerWritten);
+    };
+    syncClientBase(ghlContactId, clientBase, ownerWritten);
+    appendClientRow({
+      ...clientBase,
+      contactId: ghlContactId,
+      nombre: contactName,
+      telefono: formatPhoneForReading(phoneNumber),
+      correo: req.body.email || payload.contactEmail || payload.email,
+      responsable: users.displayName(executiveName)
+    });
 
     // Envío en segundo plano. La disponibilidad ya se revisó al asignar; si nadie estaba
     // disponible (sent = false), no se envía nada y la Maestra avisa a Gerardo y a Central.
