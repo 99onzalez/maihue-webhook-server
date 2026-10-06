@@ -627,6 +627,36 @@ function isMarketingAccepted(answer) {
   return /^(s[ií]|yes|true|1|acepto)/i.test(String(answer || '').trim());
 }
 
+// Método de pago estándar, sin importar cómo lo pregunte cada formulario ("Al contado" → "Contado")
+const PAYMENT_METHODS = [
+  [/contado/i, 'Contado'],
+  [/cr[eé]dito|hipotec|banco|financ/i, 'Crédito'],
+  [/cuota|directo|plazo/i, 'Cuotas directas']
+];
+function standardPaymentMethod(answer) {
+  if (!answer) return '';
+  const hit = PAYMENT_METHODS.find(([re]) => re.test(answer));
+  return hit ? hit[1] : String(answer).trim();
+}
+
+/**
+ * Todas las respuestas del formulario como texto ("Pregunta: respuesta | ..."), tomadas de los campos
+ * personalizados que GHL manda en la raíz del webhook. Se omiten los campos que llena el propio servidor.
+ */
+async function formAnswersText(body) {
+  if (!GHL_PIT) return '';
+  try {
+    const own = new Set(Object.values(CLIENT_BASE_FIELDS));
+    return Object.keys(await getCustomFieldIds())
+      .filter(name => !own.has(name) && body[name] !== undefined && String(body[name]).trim())
+      .map(name => `${name}: ${String(body[name]).trim()}`)
+      .join(' | ');
+  } catch (err) {
+    console.warn('⚠️  No se pudieron leer las respuestas del formulario:', err.message);
+    return '';
+  }
+}
+
 async function appendClientRow(lead) {
   if (!CLIENT_SHEET_URL || !CLIENT_SHEET_SECRET) {
     console.warn('⚠️  Planilla de clientes omitida (faltan CLIENT_SHEET_URL o CLIENT_SHEET_SECRET)');
@@ -642,6 +672,7 @@ async function appendClientRow(lead) {
     'Proyecto': lead.proyecto,
     'Campaña': lead.campana,
     'Segmento': lead.segmento,
+    'Método de pago': standardPaymentMethod(lead.pago),
     'Capacidad de pago': lead.capacidad || '',
     'Visita': lead.visita || '',
     'Responsable': lead.responsable,
@@ -651,7 +682,8 @@ async function appendClientRow(lead) {
     'Formulario': lead.formulario || '',
     'Anuncio': lead.anuncio || '',
     'Estado': 'Nuevo',
-    'Notas': lead.notas || ''
+    'Notas': lead.notas || '',
+    'Respuestas del formulario': lead.rawBody ? await formAnswersText(lead.rawBody) : ''
   };
   // Sheets toma como fórmula todo lo que empieza con + = - @ (p. ej. "+6M" → #ERROR!): se fuerza como texto.
   // Teléfono e ID ya los deja como texto el script de la planilla.
@@ -1024,7 +1056,9 @@ app.post('/webhook/ghl', async (req, res) => {
       formulario: formName,
       anuncio: adName,
       responsable: users.displayName(executiveName),
-      notas: phoneProblem ? `⚠️ Teléfono: ${PHONE_PROBLEM_LABELS[phoneProblem]}` : ''
+      notas: phoneProblem ? `⚠️ Teléfono: ${PHONE_PROBLEM_LABELS[phoneProblem]}` : '',
+      pago,
+      rawBody: req.body
     });
 
     // Envío en segundo plano. La disponibilidad ya se revisó al asignar; si nadie estaba
