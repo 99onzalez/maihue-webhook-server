@@ -2,6 +2,9 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# ffmpeg convierte los audios que se suben desde el panel a nota de voz (OGG Opus)
+RUN apk add --no-cache ffmpeg
+
 # Copiar archivos de dependencias
 COPY package*.json ./
 
