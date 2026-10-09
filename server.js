@@ -962,6 +962,18 @@ app.post('/webhook/ghl', async (req, res) => {
 
     console.log(`🎯 Proyecto identificado: ${projectName}`);
 
+    // Marca de "webhook recibido": la red de seguridad la usa para detectar leads que pasaron por el
+    // workflow mientras el servidor no respondía. Si ese lead ya se recuperó, no se procesa dos veces.
+    const leadKey = WEBHOOK_KEY_PREFIX + (req.body.contact_id || contactId || '');
+    const isRecovery = req.get('x-maihue-recovery') === '1';
+    if (req.body.contact_id || contactId) {
+      if (!isRecovery && await withTimeout(redisClient.get(leadKey)).catch(() => null) === 'recuperado') {
+        console.warn(`↩️  ${contactName} ya se procesó al recuperarlo tras una caída: se ignora este webhook`);
+        return res.json({ success: true, duplicate: true });
+      }
+      withTimeout(redisClient.set(leadKey, isRecovery ? 'recuperado' : 'webhook', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+    }
+
     // Asignar ejecutivo: si GHL ya trae un owner reconocible (asignación manual o prueba), se respeta;
     // si no, decide el horario de trabajo y el servidor lo escribe de vuelta en GHL.
     // Si ese owner no está disponible, se aplica la misma cadena de respaldo.
@@ -1067,6 +1079,10 @@ app.post('/webhook/ghl', async (req, res) => {
     // disponible (sent = false), no se envía nada y la Maestra avisa a Gerardo y a Central.
     (async () => {
       if (contactable) {
+        // El envío espera en memoria: si el servidor se reinicia antes de terminar, el aviso de
+        // envíos pendientes lo detecta (la marca se borra cuando el lead recibió todo)
+        const pendingKey = ghlContactId || phoneNumber;
+        markSendPending(pendingKey, { name: contactName, executive: executiveName, project: projectDisplay });
         sendMessageAndAudio(
           phoneNumber,
           contactName,
@@ -1076,11 +1092,15 @@ app.post('/webhook/ghl', async (req, res) => {
           instanceId,
           randomBetween(TEXT_DELAY_RANGE)
         ).then(() => {
+          clearSendPending(pendingKey);
           // Confirmación al ejecutivo cuando el lead ya recibió todo
           const received = audio ? 'el mensaje y el audio' : 'el mensaje';
           notifyExecutive(executiveName, `⚡ A ${leadFirstName} ya le llegó ${received}, ¡vamos por ese cierre!`);
         }).catch(err => {
           console.error('Error en envío de mensaje/audio:', err.message);
+          clearSendPending(pendingKey);
+          alertUnsent({ name: contactName, executive: executiveName, project: projectDisplay },
+            'El envío automático falló (puede que le haya llegado solo el texto).');
         });
       } else {
         console.warn(`📵 No se envía WhatsApp a ${contactName}: ${phoneProblem ? 'teléfono con problema' : 'nadie disponible'}`);
@@ -1335,6 +1355,53 @@ if (process.env.DISABLE_MONITOR !== '1') {
 }
 
 // =====================
+// ENVÍOS PENDIENTES
+// =====================
+// El texto y el audio esperan en memoria (25–40 s y otro minuto más). Si el servidor se reinicia en ese
+// rato, el envío se pierde en silencio. Cada envío queda anotado en Redis hasta que el lead recibe todo;
+// si una anotación pasa de 10 minutos, se avisa al responsable y a Gerardo. No se reenvía solo: si el
+// texto alcanzó a salir, el lead lo recibiría dos veces.
+
+const PENDING_SENDS_KEY = 'envios-pendientes';
+const PENDING_SEND_MAX_MS = 10 * 60 * 1000;
+const PENDING_CHECK_INTERVAL_MS = Number(process.env.PENDING_CHECK_INTERVAL_MS) || 2 * 60 * 1000;
+
+// Si Redis falla, el envío sigue igual (solo se pierde la anotación)
+function markSendPending(key, info) {
+  if (!key) return;
+  withTimeout(Promise.resolve().then(() => redisClient.hSet(PENDING_SENDS_KEY, key, JSON.stringify({ ...info, since: Date.now() })))).catch(() => {});
+}
+
+function clearSendPending(key) {
+  if (!key) return;
+  withTimeout(Promise.resolve().then(() => redisClient.hDel(PENDING_SENDS_KEY, key))).catch(() => {});
+}
+
+function alertUnsent({ name, executive, project }, reason) {
+  const text = `⚠️ A ${name} quizá no le llegó el WhatsApp (${project})\n${reason} Revisa la conversación y escríbele a mano si hace falta.`;
+  const recipients = [...new Set([executive, SCHEDULE_DEFAULT_EXECUTIVE].filter(Boolean))];
+  recipients.forEach(r => notifyExecutive(r, text, null, { immediate: true }));
+}
+
+async function checkPendingSends() {
+  const pending = await withTimeout(redisClient.hGetAll(PENDING_SENDS_KEY));
+  const now = Date.now();
+  for (const [key, raw] of Object.entries(pending || {})) {
+    let info;
+    try { info = JSON.parse(raw); } catch { info = {}; }
+    if (info.since && now - info.since < PENDING_SEND_MAX_MS) continue;
+    await withTimeout(redisClient.hDel(PENDING_SENDS_KEY, key)).catch(() => {});
+    console.warn(`⚠️ Envío pendiente hace más de 10 min: ${info.name || key} (probable reinicio a mitad del envío)`);
+    alertUnsent({ name: info.name || 'un lead', executive: info.executive, project: info.project || 'proyecto sin dato' },
+      'El servidor se reinició mientras le enviaba el mensaje y el audio.');
+  }
+}
+
+if (process.env.DISABLE_PENDING_CHECK !== '1') {
+  setInterval(() => checkPendingSends().catch(err => console.error('❌ Revisión de envíos pendientes:', err.message)), PENDING_CHECK_INTERVAL_MS);
+}
+
+// =====================
 // RED DE SEGURIDAD DE LEADS
 // =====================
 // Si un lead de una campaña Cyber entra a GHL pero el workflow de captura no se dispara (pasó el 8 de
@@ -1364,7 +1431,7 @@ async function enrollInCaptureWorkflow(contactId, project, notice) {
   if (!workflowId) return false;
   const key = LEAD_SWEEP_KEY_PREFIX + contactId;
   if (await withTimeout(redisClient.get(key)).catch(() => null)) return false; // ya se rescató antes
-  await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+  await withTimeout(redisClient.set(key, project, { EX: 7 * 24 * 60 * 60 })).catch(() => {}); // el proyecto sirve si después hay que recuperarlo
   try {
     await axios.post(`${GHL_API_URL}/contacts/${contactId}/workflow/${workflowId}`, {}, { headers: ghlHeaders(), timeout: 10000 });
   } catch (err) {
@@ -1372,6 +1439,64 @@ async function enrollInCaptureWorkflow(contactId, project, notice) {
     throw err;
   }
   notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE, notice, null, { immediate: true });
+  return true;
+}
+
+// Si el servidor no respondía cuando el workflow llamó al webhook, el contacto queda con cyber-oct26
+// pero sin la marca webhook:<id> ni el tag base-clientes, y nadie lo vuelve a procesar. Se rearma el
+// webhook con los datos del contacto y se le envía al propio servidor, que hace todo como siempre.
+const WEBHOOK_KEY_PREFIX = 'webhook:';
+const WEBHOOK_MISS_MIN_AGE_MS = 8 * 60 * 1000; // el webhook normal llega en segundos
+const WEBHOOK_TRACKING_KEY = 'webhook-tracking-since';
+let webhookTrackingSince = null; // los contactos anteriores a la primera versión con la marca no se revisan
+
+async function recoverMissedWebhook(contact) {
+  if (!webhookTrackingSince) {
+    await withTimeout(redisClient.set(WEBHOOK_TRACKING_KEY, String(Date.now()), { NX: true }));
+    webhookTrackingSince = Number(await withTimeout(redisClient.get(WEBHOOK_TRACKING_KEY))) || null;
+    if (!webhookTrackingSince) return false;
+  }
+  if (new Date(contact.dateAdded).getTime() < webhookTrackingSince) return false;
+  if ((contact.tags || []).includes(CLIENT_BASE_TAG)) return false; // el servidor ya lo procesó
+  const key = WEBHOOK_KEY_PREFIX + contact.id;
+  if (await withTimeout(redisClient.get(key))) return false; // si Redis no responde, lanza y no se toca nada
+
+  const name = capitalizeWords(String(contact.contactName || [contact.firstName, contact.lastName].filter(Boolean).join(' ') || 'Sin nombre'));
+  const attribution = cyberAttribution(contact);
+  const rescued = await withTimeout(redisClient.get(LEAD_SWEEP_KEY_PREFIX + contact.id)).catch(() => null);
+  const project = CYBER_CAPTURE_WORKFLOWS[rescued] ? rescued
+    : attribution ? (/trical/i.test(`${attribution.utmContent} ${attribution.utmMedium}`) ? 'tricalen' : 'volkania') : null;
+  await withTimeout(redisClient.set(key, 'recuperando', { EX: 7 * 24 * 60 * 60 })); // nunca se recupera dos veces
+  console.warn(`🛟 Red de seguridad: ${name} pasó por el workflow pero el webhook nunca llegó al servidor`);
+
+  if (!project) {
+    notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+      `⚠️ Lead sin WhatsApp automático — ${name}\nPasó por el workflow cuando el servidor no respondía y no pude saber de qué proyecto es. Contáctalo a mano desde GHL.`,
+      null, { immediate: true });
+    return true;
+  }
+  const ids = await getCustomFieldIds().catch(() => ({}));
+  const field = fieldName => (contact.customFields || []).find(f => f.id === ids[fieldName])?.value;
+  const opportunityId = await axios.get(`${GHL_API_URL}/opportunities/search`, {
+    headers: ghlHeaders(), params: { location_id: GHL_LOCATION_ID, contact_id: contact.id, limit: 1 }, timeout: 10000
+  }).then(r => r.data.opportunities?.[0]?.id).catch(() => undefined);
+  const projectName = PROJECT_DISPLAY_NAMES[project] || project;
+  try {
+    await axios.post(`http://127.0.0.1:${PORT}/webhook/ghl`, {
+      contact_id: contact.id, full_name: name, phone: contact.phone, email: contact.email,
+      tags: (contact.tags || []).join(', '), contact: { lastAttributionSource: attribution || {} },
+      customData: { contactId: contact.id, project, campaign: 'Cyber', visita: field('Cyber Visita'), pago: field('Cyber Pago'), pie: field('Cyber Pie'), opportunityId }
+    }, { headers: { 'x-maihue-recovery': '1' }, timeout: 30000 });
+    notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+      `🛟 Lead recuperado tras una caída — ${name} (${projectName})\nPasó por el workflow cuando el servidor no respondía. Ya lo procesé: le llega su WhatsApp y al responsable el aviso normal.`,
+      null, { immediate: true });
+  } catch (err) {
+    await withTimeout(redisClient.set(key, 'fallido', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+    console.error(`❌ Red de seguridad: no se pudo reprocesar a ${name}:`, err.response?.data?.error || err.response?.status || err.message);
+    notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+      `⚠️ Lead sin WhatsApp automático — ${name} (${projectName})\nPasó por el workflow cuando el servidor no respondía y no pude reprocesarlo. Contáctalo a mano desde GHL.`,
+      null, { immediate: true });
+  }
   return true;
 }
 
@@ -1384,7 +1509,15 @@ async function sweepMissedLeads() {
   for (const contact of data.contacts || []) {
     const age = now - new Date(contact.dateAdded).getTime();
     if (age > LEAD_SWEEP_MAX_AGE_MS) break; // vienen ordenados del más nuevo al más antiguo
-    if (age < LEAD_SWEEP_MIN_AGE_MS || (contact.tags || []).includes('cyber-oct26')) continue;
+    if (age < LEAD_SWEEP_MIN_AGE_MS) continue;
+    if ((contact.tags || []).includes('cyber-oct26')) {
+      // Pasó por el workflow: falta confirmar que el webhook haya llegado al servidor
+      if (age >= WEBHOOK_MISS_MIN_AGE_MS) {
+        await recoverMissedWebhook(contact).catch(err =>
+          console.error(`❌ Red de seguridad: no se pudo revisar el webhook de ${contact.id}:`, err.response?.status || err.message));
+      }
+      continue;
+    }
     const attribution = cyberAttribution(contact);
     if (!attribution) continue; // no viene de una campaña Cyber (p. ej. un mensaje de Instagram)
     const project = /trical/i.test(`${attribution.utmContent} ${attribution.utmMedium}`) ? 'tricalen' : 'volkania';
@@ -1419,6 +1552,10 @@ const META_LEAD_FORMS = Object.fromEntries(
   (process.env.META_LEAD_FORMS || 'volkania=1052981794437274;tricalen=1845920083519484')
     .split(';').map(pair => pair.split('=').map(s => s.trim())).filter(([k, v]) => k && v)
 );
+// Además se detectan solos los formularios activos de la página cuyo nombre calce con el filtro (por
+// defecto "cyber"): los leads se agregan al workflow de captura del Cyber, así que un formulario de otra
+// campaña no debe entrar aquí. El proyecto sale del nombre (Tricalém/Tricalén o VO/Volkania).
+const META_FORM_NAME_FILTER = new RegExp(process.env.META_FORM_NAME_FILTER || 'cyber', 'i');
 const META_SYNC_INTERVAL_MS = Number(process.env.META_SYNC_INTERVAL_MS) || 5 * 60 * 1000;
 const META_LEAD_MIN_AGE_MS = 8 * 60 * 1000;       // le da tiempo a la integración normal Meta → GHL
 const META_LEAD_MAX_AGE_MS = 12 * 60 * 60 * 1000;
@@ -1427,7 +1564,35 @@ const META_RECOVERED_TAG = 'meta-recuperado';
 let metaPageToken = null;
 
 function metaError(err) {
-  return err.response?.data?.error?.message || err.response?.status || err.message;
+  const e = err.response?.data?.error;
+  if (!e) return err.response?.status || err.message;
+  return `${e.message} (código ${e.code ?? '?'}${e.error_subcode ? `/${e.error_subcode}` : ''}${e.type ? `, ${e.type}` : ''})`;
+}
+
+// Si la lectura completa falla seguido por más de 30 minutos, se avisa a Gerardo una vez, y otra
+// cuando vuelve a funcionar (las demás capas siguen activas mientras tanto)
+const META_FAILURE_ALERT_MS = 30 * 60 * 1000;
+let metaFailingSince = null;
+let metaFailureAlerted = false;
+
+function metaSyncFailed(err) {
+  const now = Date.now();
+  if (!metaFailingSince) metaFailingSince = now;
+  if (!metaFailureAlerted && now - metaFailingSince >= META_FAILURE_ALERT_MS) {
+    metaFailureAlerted = true;
+    const since = new Date(metaFailingSince).toLocaleTimeString('es-CL', { timeZone: SCHEDULE_TIMEZONE, hour: '2-digit', minute: '2-digit' });
+    notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+      `⚠️ La lectura de leads desde Meta no funciona desde las ${since}\nError de Meta: ${metaError(err)}\nLas demás capas siguen activas. Revisa la app "servidor-maihue" en Meta for Developers y la calidad de la cuenta en Business Suite.`,
+      null, { immediate: true });
+  }
+}
+
+function metaSyncOk() {
+  if (metaFailureAlerted) {
+    notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE, '✅ La lectura de leads desde Meta volvió a funcionar.', null, { immediate: true });
+  }
+  metaFailingSince = null;
+  metaFailureAlerted = false;
 }
 
 async function metaGet(path, params = {}, token = META_SYSTEM_TOKEN) {
@@ -1443,6 +1608,38 @@ async function getMetaPageToken() {
   return metaPageToken;
 }
 
+function projectFromFormName(name) {
+  if (/trical/i.test(name)) return 'tricalen';
+  if (/volkania|(^|[^a-z])vo([^a-z]|$)/i.test(name)) return 'volkania';
+  return null;
+}
+
+// Formularios a revisar: los fijos (META_LEAD_FORMS) más los activos detectados en la página.
+// Devuelve [[proyecto, idFormulario], ...]; si la detección falla, quedan solo los fijos.
+let metaFormsLogged = '';
+async function getMetaLeadForms(pageToken) {
+  const forms = new Map(Object.entries(META_LEAD_FORMS).map(([project, id]) => [id, project]));
+  try {
+    const { data = [] } = await metaGet(`${META_PAGE_ID}/leadgen_forms`, { fields: 'id,name,status', limit: 100 }, pageToken);
+    const skipped = [];
+    for (const form of data) {
+      if (form.status !== 'ACTIVE' || forms.has(form.id) || !META_FORM_NAME_FILTER.test(form.name || '')) continue;
+      const project = projectFromFormName(form.name || '');
+      if (project && CYBER_CAPTURE_WORKFLOWS[project]) forms.set(form.id, project);
+      else skipped.push(form.name);
+    }
+    const summary = [...forms].map(([id, project]) => `${project}:${id}`).join(', ')
+      + (skipped.length ? ` · sin proyecto reconocible: ${skipped.join(', ')}` : '');
+    if (summary !== metaFormsLogged) { // solo se anota cuando cambia la lista
+      metaFormsLogged = summary;
+      console.log(`📋 Meta: formularios revisados → ${summary}`);
+    }
+  } catch (err) {
+    console.error('❌ Meta: no se pudieron detectar los formularios de la página; uso solo los fijos:', metaError(err));
+  }
+  return [...forms].map(([id, project]) => [project, id]);
+}
+
 // Al arrancar: deja en el log si el token sirve y qué puede leer (sin mostrar el token)
 async function verifyMetaToken() {
   const me = await metaGet('me', { fields: 'id,name' });
@@ -1450,7 +1647,7 @@ async function verifyMetaToken() {
   const granted = (perms.data || []).filter(p => p.status === 'granted').map(p => p.permission);
   console.log(`✅ Meta: token OK (${me.name || me.id}). Permisos: ${granted.join(', ') || 'no informados'}`);
   const pageToken = await getMetaPageToken();
-  for (const [project, formId] of Object.entries(META_LEAD_FORMS)) {
+  for (const [project, formId] of await getMetaLeadForms(pageToken)) {
     const form = await metaGet(formId, { fields: 'name,status,leads_count,questions' }, pageToken);
     const questionKeys = (form.questions || []).map(q => `${q.key}${q.type ? `(${q.type})` : ''}`).join(', ');
     console.log(`✅ Meta: formulario de ${project} "${form.name}" (${form.status}, ${form.leads_count ?? '?'} leads). Campos: ${questionKeys || 'no informados'}`);
@@ -1524,7 +1721,7 @@ async function syncLeadsFromMeta() {
   const pageToken = await getMetaPageToken();
   const now = Date.now();
   const since = Math.floor((now - META_LEAD_MAX_AGE_MS) / 1000);
-  for (const [project, formId] of Object.entries(META_LEAD_FORMS)) {
+  for (const [project, formId] of await getMetaLeadForms(pageToken)) {
     const { data: leads = [] } = await metaGet(`${formId}/leads`, {
       fields: 'id,created_time,field_data', limit: 100,
       filtering: JSON.stringify([{ field: 'time_created', operator: 'GREATER_THAN', value: since }])
@@ -1584,9 +1781,10 @@ async function syncLeadsFromMeta() {
 
 if (META_SYSTEM_TOKEN && process.env.DISABLE_META_LEAD_SYNC !== '1') {
   verifyMetaToken().catch(err => console.error('❌ Meta: el token no funciona:', metaError(err)));
-  setInterval(() => syncLeadsFromMeta().catch(err => {
+  setInterval(() => syncLeadsFromMeta().then(metaSyncOk).catch(err => {
     if (err.response?.status === 401 || err.response?.status === 400) metaPageToken = null; // se vuelve a pedir
     console.error('❌ Lectura de leads desde Meta:', metaError(err));
+    metaSyncFailed(err);
   }), META_SYNC_INTERVAL_MS);
 } else {
   console.log(`ℹ️  Lectura de leads desde Meta apagada (META_SYSTEM_TOKEN: ${META_SYSTEM_TOKEN ? 'ok' : 'falta'})`);
