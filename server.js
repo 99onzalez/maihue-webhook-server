@@ -1355,6 +1355,26 @@ function cyberAttribution(contact) {
   return (contact.attributions || []).find(a => /cyber/i.test(a.utmCampaign || '')) || null;
 }
 
+/**
+ * Agrega un contacto al workflow de captura de su proyecto y avisa a Gerardo por la Maestra.
+ * La marca sweep:<id> la comparten la red de seguridad y la lectura desde Meta: nadie se inscribe dos veces.
+ */
+async function enrollInCaptureWorkflow(contactId, project, notice) {
+  const workflowId = CYBER_CAPTURE_WORKFLOWS[project];
+  if (!workflowId) return false;
+  const key = LEAD_SWEEP_KEY_PREFIX + contactId;
+  if (await withTimeout(redisClient.get(key)).catch(() => null)) return false; // ya se rescató antes
+  await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+  try {
+    await axios.post(`${GHL_API_URL}/contacts/${contactId}/workflow/${workflowId}`, {}, { headers: ghlHeaders(), timeout: 10000 });
+  } catch (err) {
+    await withTimeout(redisClient.del(key)).catch(() => {}); // se reintenta en la próxima vuelta
+    throw err;
+  }
+  notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE, notice, null, { immediate: true });
+  return true;
+}
+
 async function sweepMissedLeads() {
   if (!GHL_PIT) return;
   const { data } = await axios.get(`${GHL_API_URL}/contacts/`, {
@@ -1367,28 +1387,190 @@ async function sweepMissedLeads() {
     if (age < LEAD_SWEEP_MIN_AGE_MS || (contact.tags || []).includes('cyber-oct26')) continue;
     const attribution = cyberAttribution(contact);
     if (!attribution) continue; // no viene de una campaña Cyber (p. ej. un mensaje de Instagram)
-    const key = LEAD_SWEEP_KEY_PREFIX + contact.id;
-    if (await withTimeout(redisClient.get(key)).catch(() => null)) continue; // ya se rescató antes
     const project = /trical/i.test(`${attribution.utmContent} ${attribution.utmMedium}`) ? 'tricalen' : 'volkania';
-    const workflowId = CYBER_CAPTURE_WORKFLOWS[project];
-    if (!workflowId) continue;
-    await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
     const name = capitalizeWords(String(contact.contactName || 'Sin nombre'));
     try {
-      await axios.post(`${GHL_API_URL}/contacts/${contact.id}/workflow/${workflowId}`, {}, { headers: ghlHeaders(), timeout: 10000 });
-      console.warn(`🛟 Red de seguridad: ${name} entró a GHL sin pasar por el workflow; agregado al de ${project}`);
-      notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
-        `🛟 Lead rescatado — ${name} (${PROJECT_DISPLAY_NAMES[project] || project})\nEntró a GHL pero el workflow no se disparó. Ya lo agregué al workflow: en un momento te llega el aviso normal del lead.`,
-        null, { immediate: true });
+      const enrolled = await enrollInCaptureWorkflow(contact.id, project,
+        `🛟 Lead rescatado — ${name} (${PROJECT_DISPLAY_NAMES[project] || project})\nEntró a GHL pero el workflow no se disparó. Ya lo agregué al workflow: en un momento te llega el aviso normal del lead.`);
+      if (enrolled) console.warn(`🛟 Red de seguridad: ${name} entró a GHL sin pasar por el workflow; agregado al de ${project}`);
     } catch (err) {
       console.error(`❌ Red de seguridad: no se pudo agregar a ${name} al workflow de ${project}:`, err.response?.status || err.message);
-      await withTimeout(redisClient.del(key)).catch(() => {}); // se reintenta en la próxima vuelta
     }
   }
 }
 
 if (process.env.DISABLE_LEAD_SWEEP !== '1') {
   setInterval(() => sweepMissedLeads().catch(err => console.error('❌ Red de seguridad de leads:', err.response?.status || err.message)), LEAD_SWEEP_INTERVAL_MS);
+}
+
+// =====================
+// LECTURA DE LEADS DESDE META
+// =====================
+// Algunos leads nunca llegan a GHL (el 9 de octubre, uno sin teléfono). Cada 5 minutos se leen los
+// leads de los formularios directo desde Meta; si alguno no está en GHL, se crea el contacto con sus
+// respuestas y se agrega al workflow de captura, que hace el resto como siempre.
+// El token va en el header, nunca en la URL ni en los logs.
+
+const META_SYSTEM_TOKEN = process.env.META_SYSTEM_TOKEN || null;
+const META_GRAPH_URL = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || 'v24.0'}`;
+const META_PAGE_ID = process.env.META_PAGE_ID || '101284645561084';
+// Formularios por proyecto (META_LEAD_FORMS=volkania=<id>;tricalen=<id>)
+const META_LEAD_FORMS = Object.fromEntries(
+  (process.env.META_LEAD_FORMS || 'volkania=1052981794437274;tricalen=1845920083519484')
+    .split(';').map(pair => pair.split('=').map(s => s.trim())).filter(([k, v]) => k && v)
+);
+const META_SYNC_INTERVAL_MS = Number(process.env.META_SYNC_INTERVAL_MS) || 5 * 60 * 1000;
+const META_LEAD_MIN_AGE_MS = 8 * 60 * 1000;       // le da tiempo a la integración normal Meta → GHL
+const META_LEAD_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const META_LEAD_KEY_PREFIX = 'metalead:';
+const META_RECOVERED_TAG = 'meta-recuperado';
+let metaPageToken = null;
+
+function metaError(err) {
+  return err.response?.data?.error?.message || err.response?.status || err.message;
+}
+
+async function metaGet(path, params = {}, token = META_SYSTEM_TOKEN) {
+  const { data } = await axios.get(`${META_GRAPH_URL}/${path}`, {
+    headers: { Authorization: `Bearer ${token}` }, params, timeout: 15000
+  });
+  return data;
+}
+
+// Los leads se leen con el token de la página, que se obtiene con el del usuario del sistema
+async function getMetaPageToken() {
+  if (!metaPageToken) metaPageToken = (await metaGet(META_PAGE_ID, { fields: 'access_token' })).access_token;
+  return metaPageToken;
+}
+
+// Al arrancar: deja en el log si el token sirve y qué puede leer (sin mostrar el token)
+async function verifyMetaToken() {
+  const me = await metaGet('me', { fields: 'id,name' });
+  const perms = await metaGet('me/permissions').catch(() => ({ data: [] }));
+  const granted = (perms.data || []).filter(p => p.status === 'granted').map(p => p.permission);
+  console.log(`✅ Meta: token OK (${me.name || me.id}). Permisos: ${granted.join(', ') || 'no informados'}`);
+  const pageToken = await getMetaPageToken();
+  for (const [project, formId] of Object.entries(META_LEAD_FORMS)) {
+    const form = await metaGet(formId, { fields: 'name,status,leads_count' }, pageToken);
+    console.log(`✅ Meta: formulario de ${project} "${form.name}" (${form.status}, ${form.leads_count ?? '?'} leads)`);
+  }
+}
+
+// field_data de Meta → nombre, correo, teléfono y las 3 respuestas del Cyber
+function parseMetaLead(lead) {
+  const out = { answers: {} };
+  for (const field of lead.field_data || []) {
+    const key = String(field.name || '').toLowerCase();
+    const value = (field.values || []).join(', ').trim();
+    if (!value) continue;
+    if (key === 'full_name') out.fullName = value;
+    else if (key === 'first_name') out.firstName = value;
+    else if (key === 'last_name') out.lastName = value;
+    else if (key === 'email') out.email = value.toLowerCase();
+    else if (key === 'phone_number' || key === 'phone') out.phone = value;
+    else if (/pie/.test(key)) out.answers.pie = value;
+    else if (/pag|contado|financ/.test(key)) out.answers.pago = value;
+    else if (/visit/.test(key)) out.answers.visita = value;
+  }
+  if (!out.fullName) out.fullName = [out.firstName, out.lastName].filter(Boolean).join(' ');
+  return out;
+}
+
+const phoneDigits = phone => String(phone || '').replace(/\D/g, '').slice(-8); // los 8 últimos bastan para comparar
+
+// Busca el contacto en GHL por correo y por teléfono, y confirma que coincida de verdad
+async function findGhlContact({ email, phone }) {
+  for (const query of [email, phoneDigits(phone)].filter(Boolean)) {
+    const { data } = await axios.get(`${GHL_API_URL}/contacts/`, {
+      headers: ghlHeaders(), params: { locationId: GHL_LOCATION_ID, query, limit: 10 }, timeout: 15000
+    });
+    const match = (data.contacts || []).find(c =>
+      (email && String(c.email || '').toLowerCase() === email) ||
+      (phone && phoneDigits(c.phone) && phoneDigits(c.phone) === phoneDigits(phone)));
+    if (match) return match;
+  }
+  return null;
+}
+
+async function createGhlContactFromMeta(lead) {
+  const ids = await getCustomFieldIds();
+  const fieldIds = {
+    visita: ids['Cyber Visita'] || 'oLJszCosF4awSqM9so6y',
+    pago: ids['Cyber Pago'] || 'ur5zn76gW1vFizRpFfuD',
+    pie: ids['Cyber Pie'] || 'B4Ws1XAYIxhnHZjUp8Fu'
+  };
+  const [firstName, ...rest] = capitalizeWords(lead.fullName || 'Sin nombre').split(' ');
+  const body = {
+    locationId: GHL_LOCATION_ID, firstName, lastName: rest.join(' ') || undefined, source: 'Facebook',
+    email: lead.email || undefined, phone: lead.phone || undefined, tags: [META_RECOVERED_TAG],
+    customFields: Object.entries(lead.answers).filter(([k]) => fieldIds[k]).map(([k, value]) => ({ id: fieldIds[k], value }))
+  };
+  const { data } = await axios.post(`${GHL_API_URL}/contacts/`, body, { headers: ghlHeaders(), timeout: 15000 });
+  return data.contact;
+}
+
+async function syncLeadsFromMeta() {
+  if (!META_SYSTEM_TOKEN || !GHL_PIT) return;
+  const pageToken = await getMetaPageToken();
+  const now = Date.now();
+  const since = Math.floor((now - META_LEAD_MAX_AGE_MS) / 1000);
+  for (const [project, formId] of Object.entries(META_LEAD_FORMS)) {
+    const { data: leads = [] } = await metaGet(`${formId}/leads`, {
+      fields: 'id,created_time,field_data', limit: 100,
+      filtering: JSON.stringify([{ field: 'time_created', operator: 'GREATER_THAN', value: since }])
+    }, pageToken);
+    for (const raw of leads) {
+      if (now - new Date(raw.created_time).getTime() < META_LEAD_MIN_AGE_MS) continue;
+      const key = META_LEAD_KEY_PREFIX + raw.id;
+      if (await withTimeout(redisClient.get(key)).catch(() => null)) continue; // ya revisado
+      const lead = parseMetaLead(raw);
+      const name = capitalizeWords(lead.fullName || 'Sin nombre');
+      const projectName = PROJECT_DISPLAY_NAMES[project] || project;
+      try {
+        const existing = (lead.email || lead.phone) ? await findGhlContact(lead) : null;
+        if (existing && (existing.tags || []).includes('cyber-oct26')) {
+          // llegó bien a GHL y pasó por el workflow: nada que hacer
+        } else if (existing) {
+          const enrolled = await enrollInCaptureWorkflow(existing.id, project,
+            `🛟 Lead rescatado — ${name} (${projectName})\nEstaba en GHL pero el workflow no se disparó. Ya lo agregué al workflow: en un momento te llega el aviso normal del lead.`);
+          if (enrolled) console.warn(`🛟 Meta: ${name} estaba en GHL sin pasar por el workflow; agregado al de ${project}`);
+        } else {
+          const contact = await createGhlContactFromMeta(lead);
+          await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {}); // no crearlo dos veces
+          try {
+            await enrollInCaptureWorkflow(contact.id, project,
+              `🛟 Lead recuperado desde Meta — ${name} (${projectName})\nCompletó el formulario pero nunca llegó a GHL. Lo creé y lo agregué al workflow: en un momento te llega el aviso normal del lead.`);
+            console.warn(`🛟 Meta: ${name} completó el formulario de ${project} pero no estaba en GHL; contacto creado y agregado al workflow`);
+          } catch (err) {
+            console.error(`❌ Meta: ${name} quedó creado en GHL pero no se pudo agregar al workflow de ${project}:`, metaError(err));
+            notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+              `⚠️ Lead recuperado a medias — ${name} (${projectName})\nNo había llegado a GHL. Lo creé (tag ${META_RECOVERED_TAG}), pero no pude agregarlo al workflow: agrégalo a mano.`,
+              null, { immediate: true });
+          }
+        }
+        await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+      } catch (err) {
+        console.error(`❌ Meta: no se pudo procesar el lead de ${name} (${project}):`, metaError(err));
+        // Se reintenta en la próxima vuelta; si ya lleva 1 hora fallando, se avisa una sola vez
+        if (now - new Date(raw.created_time).getTime() > 60 * 60 * 1000) {
+          await withTimeout(redisClient.set(key, 'error', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+          notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+            `⚠️ Lead sin procesar — ${name} (${projectName})\nCompletó el formulario en Meta, no está en GHL y no pude crearlo. Revísalo en el Centro de clientes potenciales de Meta.`,
+            null, { immediate: true });
+        }
+      }
+    }
+  }
+}
+
+if (META_SYSTEM_TOKEN && process.env.DISABLE_META_LEAD_SYNC !== '1') {
+  verifyMetaToken().catch(err => console.error('❌ Meta: el token no funciona:', metaError(err)));
+  setInterval(() => syncLeadsFromMeta().catch(err => {
+    if (err.response?.status === 401 || err.response?.status === 400) metaPageToken = null; // se vuelve a pedir
+    console.error('❌ Lectura de leads desde Meta:', metaError(err));
+  }), META_SYNC_INTERVAL_MS);
+} else {
+  console.log(`ℹ️  Lectura de leads desde Meta apagada (META_SYSTEM_TOKEN: ${META_SYSTEM_TOKEN ? 'ok' : 'falta'})`);
 }
 
 /**
