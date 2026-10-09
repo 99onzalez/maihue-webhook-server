@@ -1451,28 +1451,38 @@ async function verifyMetaToken() {
   console.log(`✅ Meta: token OK (${me.name || me.id}). Permisos: ${granted.join(', ') || 'no informados'}`);
   const pageToken = await getMetaPageToken();
   for (const [project, formId] of Object.entries(META_LEAD_FORMS)) {
-    const form = await metaGet(formId, { fields: 'name,status,leads_count' }, pageToken);
-    console.log(`✅ Meta: formulario de ${project} "${form.name}" (${form.status}, ${form.leads_count ?? '?'} leads)`);
+    const form = await metaGet(formId, { fields: 'name,status,leads_count,questions' }, pageToken);
+    const questionKeys = (form.questions || []).map(q => `${q.key}${q.type ? `(${q.type})` : ''}`).join(', ');
+    console.log(`✅ Meta: formulario de ${project} "${form.name}" (${form.status}, ${form.leads_count ?? '?'} leads). Campos: ${questionKeys || 'no informados'}`);
   }
 }
 
-// field_data de Meta → nombre, correo, teléfono y las 3 respuestas del Cyber
+// field_data de Meta → nombre, correo, teléfono y las 3 respuestas del Cyber.
+// Los nombres de los campos cambian según cómo se armó el formulario (full_name, nombre_completo,
+// correo_electrónico…), así que se reconocen por nombre y, si no, por el contenido.
 function parseMetaLead(lead) {
-  const out = { answers: {} };
+  const out = { answers: {}, keys: [] };
   for (const field of lead.field_data || []) {
     const key = String(field.name || '').toLowerCase();
     const value = (field.values || []).join(', ').trim();
+    out.keys.push(key);
     if (!value) continue;
-    if (key === 'full_name') out.fullName = value;
-    else if (key === 'first_name') out.firstName = value;
-    else if (key === 'last_name') out.lastName = value;
-    else if (key === 'email') out.email = value.toLowerCase();
-    else if (key === 'phone_number' || key === 'phone') out.phone = value;
+    const looksEmail = EMAIL_PATTERN.test(value);
+    const looksPhone = /^\+?[\d\s()-]{8,}$/.test(value);
+    if (key === 'first_name' || /^nombre$/.test(key)) out.firstName = value;
+    else if (key === 'last_name' || /apellido/.test(key)) out.lastName = value;
+    else if (/mail|correo/.test(key) || (looksEmail && !out.email)) out.email = value.toLowerCase();
+    else if (/phone|tel[eé]fono|celular|whatsapp|m[oó]vil/.test(key) || (looksPhone && !out.phone)) out.phone = value;
+    else if (/name|nombre/.test(key)) out.fullName = value;
     else if (/pie/.test(key)) out.answers.pie = value;
     else if (/pag|contado|financ/.test(key)) out.answers.pago = value;
     else if (/visit/.test(key)) out.answers.visita = value;
   }
   if (!out.fullName) out.fullName = [out.firstName, out.lastName].filter(Boolean).join(' ');
+  // Meta entrega las respuestas como claves (al_siguiente_mes); se dejan legibles como en GHL
+  for (const k of Object.keys(out.answers)) {
+    out.answers[k] = out.answers[k].replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+  }
   return out;
 }
 
@@ -1527,7 +1537,16 @@ async function syncLeadsFromMeta() {
       const name = capitalizeWords(lead.fullName || 'Sin nombre');
       const projectName = PROJECT_DISPLAY_NAMES[project] || project;
       try {
-        const existing = (lead.email || lead.phone) ? await findGhlContact(lead) : null;
+        if (!lead.email && !lead.phone) {
+          // Sin correo ni teléfono no se puede buscar ni contactar: no se crea, se avisa una vez
+          console.warn(`⚠️ Meta: lead de ${project} sin correo ni teléfono reconocibles; campos: ${lead.keys.join(', ')}`);
+          await withTimeout(redisClient.set(key, 'sin-datos', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+          notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+            `⚠️ Lead en Meta sin datos de contacto — ${name} (${projectName})\nCompletó el formulario, pero no pude leer su correo ni su teléfono, así que no lo creé en GHL. Revísalo en el Centro de clientes potenciales de Meta.`,
+            null, { immediate: true });
+          continue;
+        }
+        const existing = await findGhlContact(lead);
         if (existing && (existing.tags || []).includes('cyber-oct26')) {
           // llegó bien a GHL y pasó por el workflow: nada que hacer
         } else if (existing) {
