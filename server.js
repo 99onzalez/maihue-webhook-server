@@ -272,20 +272,21 @@ function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, mat
   const header = projectEmoji ? `${projectDisplay} ${projectEmoji}` : projectDisplay;
   const phone = formatPhoneForReading(phoneNumber);
   const pie = shortPie(budgetAnswer);
+  // El correo va en todos los avisos: sirve para escribirle si no contesta el WhatsApp
+  const emailLine = email ? `✉️ ${email}${EMAIL_PATTERN.test(email) ? '' : ' (parece mal escrito)'}` : null;
   const details = [
     `👤 ${contactName} | 📱 ${phone}`,
+    emailLine,
     `🏷️ ${labelWords.join(' ')} ${segmentEmoji}`,
     pie && `💰 capacidad de pago: ${pie}`,
     answers.visita && `📅 visita: ${answers.visita}`
   ];
   if (phoneProblem) {
-    const emailLine = !email ? '✉️ No dejó correo'
-      : `✉️ ${email}${EMAIL_PATTERN.test(email) ? '' : ' (el correo también parece mal escrito)'}`;
     return [
       `📵 Lead con teléfono inválido — ${header}`,
       `👤 ${contactName} | 📱 escribió: ${rawPhone || '(nada)'}`,
-      emailLine,
-      ...details.slice(1),
+      emailLine || '✉️ No dejó correo',
+      ...details.slice(2),
       `⚠️ ${PHONE_PROBLEM_LABELS[phoneProblem]}: no se le envió WhatsApp. Escríbele al correo o búscalo en GHL.`
     ].filter(Boolean).join('\n');
   }
@@ -300,10 +301,11 @@ function buildExecutiveNotification({ projectDisplay, projectEmoji, segment, mat
     return [
       `⚠️ Nuevo lead SIN SEGMENTO — ${header}`,
       `👤 ${contactName} | 📱 ${phone}`,
+      emailLine,
       `🏷️ Tags recibidos: ${tags || 'ninguno'} (ninguno de segmento)`,
       `📨 Se le envió el mensaje y audio de Financiamiento (por defecto)`,
       `👉 Revisa sus respuestas en GHL y corrige el tag antes de llamar`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
   return [`🔔 Nuevo lead — ${header}`, ...details, derivedNote].filter(Boolean).join('\n');
 }
