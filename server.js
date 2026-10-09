@@ -1332,6 +1332,63 @@ if (process.env.DISABLE_MONITOR !== '1') {
   setInterval(() => checkInstances().catch(err => console.error('❌ Monitor de WhatsApp:', err.message)), MONITOR_INTERVAL_MS);
 }
 
+// =====================
+// RED DE SEGURIDAD DE LEADS
+// =====================
+// Si un lead de una campaña Cyber entra a GHL pero el workflow de captura no se dispara (pasó el 8 de
+// octubre con un formulario recién cambiado), el contacto queda sin el tag cyber-oct26. Cada 5 minutos
+// se buscan esos contactos y se agregan al workflow del proyecto, que hace el resto como siempre.
+
+const LEAD_SWEEP_INTERVAL_MS = Number(process.env.LEAD_SWEEP_INTERVAL_MS) || 5 * 60 * 1000;
+const LEAD_SWEEP_MIN_AGE_MS = 3 * 60 * 1000;      // le da tiempo al workflow normal
+const LEAD_SWEEP_MAX_AGE_MS = 12 * 60 * 60 * 1000; // no toca contactos antiguos
+const LEAD_SWEEP_KEY_PREFIX = 'sweep:';
+// Workflows de captura por proyecto (CYBER_CAPTURE_WORKFLOWS=volkania=<id>;tricalen=<id>)
+const CYBER_CAPTURE_WORKFLOWS = Object.fromEntries(
+  (process.env.CYBER_CAPTURE_WORKFLOWS || 'volkania=e283ce08-7743-4b2a-bc3d-4627045f9540;tricalen=309d1193-c672-44d5-99b8-b508761bcdde')
+    .split(';').map(pair => pair.split('=').map(s => s.trim())).filter(([k, v]) => k && v)
+);
+
+function cyberAttribution(contact) {
+  return (contact.attributions || []).find(a => /cyber/i.test(a.utmCampaign || '')) || null;
+}
+
+async function sweepMissedLeads() {
+  if (!GHL_PIT) return;
+  const { data } = await axios.get(`${GHL_API_URL}/contacts/`, {
+    headers: ghlHeaders(), params: { locationId: GHL_LOCATION_ID, limit: 50 }, timeout: 15000
+  });
+  const now = Date.now();
+  for (const contact of data.contacts || []) {
+    const age = now - new Date(contact.dateAdded).getTime();
+    if (age > LEAD_SWEEP_MAX_AGE_MS) break; // vienen ordenados del más nuevo al más antiguo
+    if (age < LEAD_SWEEP_MIN_AGE_MS || (contact.tags || []).includes('cyber-oct26')) continue;
+    const attribution = cyberAttribution(contact);
+    if (!attribution) continue; // no viene de una campaña Cyber (p. ej. un mensaje de Instagram)
+    const key = LEAD_SWEEP_KEY_PREFIX + contact.id;
+    if (await withTimeout(redisClient.get(key)).catch(() => null)) continue; // ya se rescató antes
+    const project = /trical/i.test(`${attribution.utmContent} ${attribution.utmMedium}`) ? 'tricalen' : 'volkania';
+    const workflowId = CYBER_CAPTURE_WORKFLOWS[project];
+    if (!workflowId) continue;
+    await withTimeout(redisClient.set(key, '1', { EX: 7 * 24 * 60 * 60 })).catch(() => {});
+    const name = capitalizeWords(String(contact.contactName || 'Sin nombre'));
+    try {
+      await axios.post(`${GHL_API_URL}/contacts/${contact.id}/workflow/${workflowId}`, {}, { headers: ghlHeaders(), timeout: 10000 });
+      console.warn(`🛟 Red de seguridad: ${name} entró a GHL sin pasar por el workflow; agregado al de ${project}`);
+      notifyExecutive(SCHEDULE_DEFAULT_EXECUTIVE,
+        `🛟 Lead rescatado — ${name} (${PROJECT_DISPLAY_NAMES[project] || project})\nEntró a GHL pero el workflow no se disparó. Ya lo agregué al workflow: en un momento te llega el aviso normal del lead.`,
+        null, { immediate: true });
+    } catch (err) {
+      console.error(`❌ Red de seguridad: no se pudo agregar a ${name} al workflow de ${project}:`, err.response?.status || err.message);
+      await withTimeout(redisClient.del(key)).catch(() => {}); // se reintenta en la próxima vuelta
+    }
+  }
+}
+
+if (process.env.DISABLE_LEAD_SWEEP !== '1') {
+  setInterval(() => sweepMissedLeads().catch(err => console.error('❌ Red de seguridad de leads:', err.response?.status || err.message)), LEAD_SWEEP_INTERVAL_MS);
+}
+
 /**
  * Ver a quién se asignaría un lead ahora (o en ?at=2026-10-05T15:30:00-03:00), sin asignar ni enviar nada
  */
